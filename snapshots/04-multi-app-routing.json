@@ -1,0 +1,101 @@
+{
+  "device": null,
+  "samplerate": 44100,
+  "blocksize": 256,
+  "hf_band_hz": [
+    1500,
+    16000
+  ],
+  "hf_ratio_min": 0.45,
+  "tail_hf_ratio_min": 0.65,
+  "noise_ratio_thresh": 14.0,
+  "attack_ratio": 4.0,
+  "abs_floor_db": -20.0,
+  "decay_frac": 0.08,
+  "min_decay_ms": 20.0,
+  "max_decay_ms": 160.0,
+  "refractory_ms": 220.0,
+  "reject_refractory_ms": 12.0,
+  "require_double": false,
+  "double_min_ms": 120.0,
+  "double_max_ms": 700.0,
+  "trigger_cooldown_ms": 700.0,
+  "key": "ctrl+d",
+  "target_processes": [
+    "claude.exe"
+  ],
+  "send_key": "enter",
+  "send_delay_ms": 1500.0,
+  "recording_max_s": 180.0,
+  "strict_tail_hf_ratio_min": 0.7,
+  "min_recording_ms": 700.0,
+  "send_window_ms": 1000.0,
+  "confirm_stop_with_silence": true,
+  "speech_band_hz": [
+    100,
+    900
+  ],
+  "speech_window_ms": [
+    150,
+    300
+  ],
+  "speech_over_floor_db": 14.0,
+  "speech_floor_fall": 0.25,
+  "speech_floor_rise": 0.0001,
+  "profiles": [
+    {
+      "name": "Claude desktop",
+      "process": "claude.exe",
+      "title": null,
+      "mode": "dictation",
+      "activate": "ctrl+d",
+      "send": "enter",
+      "enabled": true
+    },
+    {
+      "name": "Codex",
+      "process": "chatgpt.exe",
+      "title": "^Codex$",
+      "mode": "oneshot",
+      "activate": "ctrl+b",
+      "send": null,
+      "enabled": true
+    },
+    {
+      "name": "ChatGPT",
+      "process": "chatgpt.exe",
+      "title": "^ChatGPT$",
+      "mode": "oneshot",
+      "activate": "ctrl+b",
+      "send": null,
+      "enabled": true
+    },
+    {
+      "name": "Antigravity",
+      "process": "antigravity.exe",
+      "title": null,
+      "mode": "dictation",
+      "activate": "ctrl+m",
+      "send": "enter",
+      "enabled": true
+    },
+    {
+      "name": "Antigravity IDE",
+      "process": "antigravity ide.exe",
+      "title": null,
+      "mode": "oneshot",
+      "activate": null,
+      "send": null,
+      "enabled": false
+    },
+    {
+      "name": "VS Code",
+      "process": "code.exe",
+      "title": null,
+      "mode": "oneshot",
+      "activate": null,
+      "send": null,
+      "enabled": false
+    }
+  ]
+}
