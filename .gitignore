@@ -1,0 +1,15 @@
+# Recordings. Kept on disk deliberately - CALIBRATION.md treats them as journal
+# evidence and --replay runs against them - but they are tens of megabytes of
+# binary that git can only store whole, and a new one is produced every session.
+*.wav
+
+# Listener output and analysis runs. Regenerated on every start; snap.log is
+# held open by the running listener.
+*.log
+*.log.session*
+*.marker
+
+# Superseded by version control itself.
+*.bak-*
+__pycache__/
+*.pyc
