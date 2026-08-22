@@ -7,6 +7,7 @@ Two halves:
      to check the shipped config.json against ground truth.
 """
 import inspect
+import json
 import io
 import re
 import sys
@@ -720,6 +721,50 @@ check("the listener logs titles through loggable()",
       "loggable(title)" in inspect.getsource(_s.listen), True)
 check("...but resolves profiles against the raw title",
       "resolve_profile(exe, title" in inspect.getsource(_s.listen), True)
+
+# README quotes concrete numbers at the reader, and those numbers are promises
+# about what the tool will do. They came adrift once already: calibration wrote
+# send_window_ms 750, double_min_ms 228 and double_max_ms 911 into config.json,
+# while README went on saying 1000 and "120 to 700 ms" because that prose had
+# been written against DEFAULTS. Both were internally consistent, so no test
+# noticed, and anyone using the repository as shipped was reading the wrong
+# numbers. The doc-agreement checks above only covered flags, pass titles and
+# criterion wording, never values.
+#
+# Each number has to appear near the key it belongs to, not merely somewhere in
+# the file, or a value like 5 or 14 would match by accident and assert nothing.
+_SHIPPED = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+_NEAR = 260
+
+def _quoted_near(key, value):
+    """Does README state this value within a couple of sentences of this key?"""
+    text = ("%d" % value) if float(value).is_integer() else ("%g" % value)
+    mark = "`%s`" % key
+    at = README_.find(mark)
+    while at != -1:
+        if text in README_[max(0, at - _NEAR):at + _NEAR]:
+            return True
+        at = README_.find(mark, at + 1)
+    return False
+
+# Only the settings README actually states a number for. Others, such as
+# abs_floor_db, are named and described without a value, which is fine: there
+# is nothing to drift.
+_STATED = ["send_window_ms", "double_min_ms", "double_max_ms",
+           "tail_hf_ratio_min", "strict_tail_hf_ratio_min",
+           "speech_over_floor_db", "pair_refractory_ms", "send_delay_ms",
+           "min_recording_ms", "recording_max_s", "reject_refractory_ms",
+           "refractory_ms", "min_decay_ms",
+           "speech_floor_fall", "speech_floor_rise"]
+
+_adrift = [k for k in _STATED if not _quoted_near(k, _SHIPPED[k])]
+check("every number README states matches the config that ships", _adrift, [])
+
+# The same drift in the other direction: DEFAULTS is what a reader gets if they
+# delete a key, so where README quotes one it has to say so rather than let it
+# read as the live value.
+check("...and where README quotes a built-in default it labels it as one",
+      README_.count("built-in default") >= 2, True)
 
 check("the terminal list covers the common shells",
       {"cmd.exe", "powershell.exe", "pwsh.exe",
