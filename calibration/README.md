@@ -23,6 +23,6 @@ python ../snap_to_dictate.py --derive <stamp>.wav
 ```
 
 None of it is committed. The recordings are tens of megabytes of binary, and the
-journals describe one person's room, microphone and voice — so they would not
+journals describe one person's room, microphone and voice, so they would not
 mean anything on another machine, and without the matching `.wav` nobody could
 check them anyway.

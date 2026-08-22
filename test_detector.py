@@ -644,7 +644,7 @@ check("the document describes as many passes as the code runs",
       _DOC.count(NL_ + "### Pass "), len(CAL_PASSES))
 for _i, _p in enumerate(CAL_PASSES, 1):
     check("...pass %d is %s in both" % (_i, _p["title"]),
-          ("### Pass %d — %s" % (_i, _p["title"])) in _DOC, True)
+          ("### Pass %d: %s" % (_i, _p["title"])) in _DOC, True)
 
 # The gate is the part a user relies on to not be handed a broken config, so
 # each criterion has to survive in both places or in neither.

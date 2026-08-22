@@ -1,8 +1,8 @@
-# AGENTS.md — installing and changing Snap-To-Dictate
+# AGENTS.md, installing and changing Snap-To-Dictate
 
 Written for an agent, not a person. A human setting this up should read
-[README.md](README.md); this file is the version that assumes you will run
-commands, read exit codes, and edit source. Everything here is checkable — if a
+[README.md](README.md). This file is the version that assumes you will run
+commands, read exit codes, and edit source. Everything here is checkable. If a
 claim below disagrees with the code, the code is right and this file is a bug.
 
 Three documents, three jobs, no overlap:
@@ -19,10 +19,10 @@ Three documents, three jobs, no overlap:
 
 A background process listens to the microphone, recognises a finger snap, and
 presses a keyboard shortcut into whichever window is in front. One snap toggles
-dictation in the app you are looking at; two fast snaps stop dictation and
+dictation in the app you are looking at. Two fast snaps stop dictation and
 submit. Which shortcut gets pressed depends on which app has focus, so the same
 gesture drives the Claude desktop app, ChatGPT, Codex and an IDE without you
-telling it which one you meant. It is Windows-only, because it is built on
+telling it which one you meant. It is Windows only, because it is built on
 `SendInput` and the Win32 foreground-window API.
 
 ---
@@ -42,8 +42,8 @@ python snap_to_dictate.py --verify
 ```
 
 **`--verify` is the contract between you and this repository.** It exits `0`
-when the tool can work and non-zero when it cannot, so branch on the exit code,
-not on the text. Add `--json` for a parseable report:
+when the tool can work and non-zero when it cannot, so branch on the exit code
+rather than on the text. Add `--json` for a parseable report:
 
 ```bash
 python snap_to_dictate.py --verify --json
@@ -58,18 +58,18 @@ python snap_to_dictate.py --verify --json
 
 `status` is one of three values and they mean different things:
 
-- **`FAIL`** — the tool cannot work as installed. `failed` lists these by name.
-  Exit code is 1 whenever this list is non-empty.
-- **`WARN`** — it can work, but something a person chose is worth surfacing: no
-  listener running, no wired app open, a profile left unconfigured. Never
-  affects the exit code.
-- **`OK`** — checked and good. Never means assumed.
+- **`FAIL`** means the tool cannot work as installed. `failed` lists these by
+  name. Exit code is 1 whenever that list is non-empty.
+- **`WARN`** means it can work, but something a person chose is worth
+  surfacing, such as no listener running, no wired app open, or a profile left
+  unconfigured. It never affects the exit code.
+- **`OK`** means checked and good. It never means assumed.
 
 `--verify` presses no keys and holds the microphone for under half a second. It
 is safe to run on a machine mid-session, including one where a listener is
-already running — it detects that and reports it rather than disturbing it. The
-test suite asserts all three of those properties by reading the source, because
-asserting them by running it would need a microphone.
+already running, because it detects that and reports it rather than disturbing
+it. The test suite asserts all three of those properties by reading the source,
+because asserting them by running it would need a microphone.
 
 ### Start it
 
@@ -90,10 +90,10 @@ python snap_to_dictate.py --stop
 
 ## Architecture
 
-Audio arrives in 256-sample blocks at 44.1 kHz — **5.805 ms per block**, the
-unit every timing in this program is quantised to. A decay of "52.2 ms" is nine
-blocks; there are no intermediate values, and a threshold set between two
-multiples of 5.805 behaves exactly like the lower one.
+Audio arrives in 256-sample blocks at 44.1 kHz, so **5.805 ms per block**. That
+is the unit every timing in this program is quantised to. A decay of "52.2 ms"
+is nine blocks. There are no intermediate values, and a threshold set between
+two multiples of 5.805 behaves exactly like the lower one.
 
 ```
 microphone
@@ -118,7 +118,7 @@ send_key_if_focused()                re-reads focus, then SendInput
 The one non-obvious thing about the detector: **`push()` already groups blocks
 into events.** It returns `None` for most blocks and a single event dict at the
 end of the verify stage. Code that counts blocks where something was loud is
-counting the wrong thing; the event is the unit.
+counting the wrong thing. The event is the unit.
 
 ### Where to change what
 
@@ -161,21 +161,21 @@ A profile says: when *this* window is in front, press *this* key.
 
 | Field | Meaning |
 |---|---|
-| `process` | executable name, lower-case; `null` to match on title alone |
-| `title` | regex against the window title; `null` to match on process alone |
-| `mode` | `dictation` — snap toggles on/off. `oneshot` — snap fires once, no stop |
+| `process` | executable name, lower-case. `null` to match on title alone |
+| `title` | regex against the window title. `null` to match on process alone |
+| `mode` | `dictation` means a snap toggles on and off. `oneshot` means a snap fires once, with no stop |
 | `activate` | key that starts or stops dictation |
-| `send` | key that submits after a stop; `null` for none |
+| `send` | key that submits after a stop. `null` for none |
 | `enabled` | `false` parks a profile without deleting it |
 
-Matching is **most specific first**: a profile with both `process` and `title`
+Matching is **most specific first**. A profile with both `process` and `title`
 beats one with only `process`. That is not a nicety. The ChatGPT desktop app
 serves its chat window and its Codex window from one executable at one PID, so
 only the anchored title `^Codex$` separates them. For the same reason, all focus
 comparisons elsewhere in the program are done by **profile name, never by
-process** — two profiles can share an executable.
+process**, because two profiles can share an executable.
 
-A disabled profile with `"activate": null` is a legitimate placeholder: the app
+A disabled profile with `"activate": null` is a legitimate placeholder. The app
 is wired up and waiting for somebody to find its dictation shortcut.
 `profile_ready()` refuses to send for it, and `--verify` reports it as a `WARN`.
 
@@ -184,32 +184,32 @@ is wired up and waiting for somebody to find its dictation shortcut.
 ## Invariants
 
 Break one of these and the tool becomes dangerous rather than merely broken.
-Each has a test, so you will find out — run `python test_detector.py` before
+Each has a test, so you will find out. Run `python test_detector.py` before
 concluding a change is fine.
 
 **1. No profile may ever match a terminal.** `ctrl+d` is dictation in the Claude
-desktop app and *end-of-input in every shell*. A stop that lands in a terminal
+desktop app and *end of input in every shell*. A stop that lands in a terminal
 closes it, and when that terminal is running an agent, the agent dies mid-task.
-The program carries a `TERMINALS` list; `--verify` checks every entry against
+The program carries a `TERMINALS` list. `--verify` checks every entry against
 the live config, and the test suite checks it against the shipped one.
 
 **2. A delayed keystroke must re-read focus immediately before pressing.** Three
-sends happen later than the focus check that authorised them: a held stop waits
+sends happen later than the focus check that authorised them. A held stop waits
 up to `PENDING_TIMEOUT_MS` for the room to go quiet, a submit waits
 `send_delay_ms` for the transcript to land, and a manual submit waits for
 confirmation. All three go through `send_key_if_focused()`, which re-reads the
 foreground window and drops the keystroke if focus moved. Any new delayed send
-must use it too — a test counts the call sites and fails if a bare `send_key()`
+must use it too. A test counts the call sites and fails if a bare `send_key()`
 appears on a deferred path.
 
 **3. One listener at a time.** The named event `Local\SnapToDictate.stop` is
 both the singleton lock and the shutdown channel. A second copy exits before it
 opens the microphone. Tests use a private event name so they never shut down a
-live listener; do the same in anything new.
+live listener. Do the same in anything new.
 
 **4. Documentation and code must agree.** README.md and CALIBRATION.md once
-described commands that did not exist — `--diagnose` was in the setup table for
-a while, and CALIBRATION.md described a seven-pass protocol against code that
+described commands that did not exist. `--diagnose` was in the setup table for a
+while, and CALIBRATION.md described a seven-pass protocol against code that
 recorded three seconds and five snaps. The test suite now asserts that every
 flag named in either document parses, that the documented pass list matches
 `CAL_PASSES` exactly, and that each acceptance criterion appears in both places.
@@ -225,29 +225,29 @@ Full reasoning is in [CALIBRATION.md](CALIBRATION.md). The operational summary:
 python snap_to_dictate.py --calibrate
 ```
 
-Seven passes: 237 seconds of recording, about five minutes of wall clock once the
-prompts between passes are counted. It lands as one WAV
-plus a `.passes.json` sidecar marking where each pass starts and ends. It then
-derives a config and applies an acceptance gate. **A config is written only if
-all six checks pass**; otherwise `config.json` is left exactly as it was and the
+Seven passes: 237 seconds of recording, about five minutes of wall clock once
+the prompts between passes are counted. It lands as one WAV plus a
+`.passes.json` sidecar marking where each pass starts and ends. It then derives
+a config and applies an acceptance gate. **A config is written only if all six
+checks pass.** Otherwise `config.json` is left exactly as it was and the
 recording is kept, so a fixed derivation can be re-run without asking the user
 to perform it again:
 
 ```bash
-python snap_to_dictate.py --derive calibration/<stamp>.wav
+python snap_to_dictate.py --derive calibration/2026-08-22-0436.wav
 ```
 
-Calibration derives **levels and timings only** — `abs_floor_db`,
-`speech_over_floor_db`, the pairing window, `send_window_ms`. It deliberately
-leaves the shape gates (`hf_ratio_min`, `tail_hf_ratio_min`, the decay bounds)
-and `pair_refractory_ms` alone. Those describe the physics of a snap and the
-mechanics of the detector, not a property of a room, and fitting them to one
-unlabelled take made both worse. CALIBRATION.md, *What calibration does not
-derive*, has the measurements.
+Calibration derives **levels and timings only**, meaning `abs_floor_db`,
+`speech_over_floor_db`, the pairing window, and `send_window_ms`. It
+deliberately leaves the shape gates (`hf_ratio_min`, `tail_hf_ratio_min`, the
+decay bounds) and `pair_refractory_ms` alone. Those describe the physics of a
+snap and the mechanics of the detector, not a property of a room, and fitting
+them to one unlabelled take made both worse. CALIBRATION.md, *What calibration
+does not derive*, has the measurements.
 
 Do not "fix" a failing acceptance check by loosening it. One check was relaxed
 in this repository's history and it took three independent measurements to
-justify — the reasoning is written into the code beside the check.
+justify. The reasoning is written into the code beside the check.
 
 ---
 
@@ -260,18 +260,19 @@ python test_detector.py
 No microphone, no network, no fixtures to download. Exit code is non-zero on any
 failure. Three kinds of check live in there:
 
-1. **Synthetic audio** through the full detector — snaps, thumps, speech, ticks.
+1. **Synthetic audio** through the full detector, so snaps, thumps, speech and
+   ticks.
 2. **A replay of a labelled field log** against the shipped `config.json`, so a
    tuning change that breaks real ground truth is caught immediately.
-3. **Structural assertions** — the invariants above, and the documentation
+3. **Structural assertions**, meaning the invariants above and the documentation
    agreement described in invariant 4.
 
 ---
 
 ## Known limits
 
-README.md, *Known gaps*, is the honest list. The one most likely to surprise you:
-**a hard keystroke near the microphone measures the same as a snap.** Levels
-overlap and shape does not separate them, so this is not a tuning problem and no
-threshold fixes it. A quiet room fires nothing; typing right beside the mic can
-occasionally send.
+README.md, *Known gaps*, is the honest list. The one most likely to surprise
+you: **a hard keystroke near the microphone measures the same as a snap.**
+Levels overlap and shape does not separate them, so this is not a tuning problem
+and no threshold fixes it. A quiet room fires nothing, but typing right beside
+the mic can occasionally send.
