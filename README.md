@@ -1,13 +1,42 @@
 # Snap-To-Dictate
 
-Snap your fingers to start and stop dictation. Works with the Claude desktop
-app, ChatGPT, Codex and Antigravity.
+**Snap your fingers to start dictating. Snap again to stop. Snap twice to
+send.**
 
-The apps have no audio trigger of their own. Dictation is bound to a **key**,
-Ctrl+D in Claude. So the job splits in two:
+Claude, ChatGPT, Codex and the rest all take voice input, and every one of them
+hides it behind a keyboard shortcut. Ctrl+D here, something else there. So
+"voice input" still means reaching for the keyboard to start, reaching for it
+again to stop, and reaching a third time to send. You end up typing in order to
+avoid typing, and the one thing voice was supposed to buy you, keeping your
+hands where they already were, is exactly what you hand back.
 
-1. A background listener watches the mic for a finger snap.
-2. When it hears one, it presses that key into whichever window is in front.
+This is the button those apps do not have. A snap starts dictation in whatever
+window is in front of you. Another snap stops it. Two quick snaps stop it and
+submit. A whole prompt goes out without your hands touching anything.
+
+That is worth the most when the keyboard is the awkward part of the room:
+
+- dictating something long, where the reach for a shortcut is the thing that
+  breaks your train of thought
+- sitting or pacing on the other side of the room, because that is where you
+  think best
+- cooking, holding a baby, on a treadmill, hands already full of something else
+- any reason a keyboard costs you more than it costs other people, an RSI, a
+  tremor, limited reach
+
+Why a snap and not a wake word. A snap is a sharp broadband transient. It is
+loud in exactly the band a quiet room is not, it still registers from across
+the room, and identifying one needs no speech recognition at all. There is no
+phrase to be misheard, no transcriber running all day, no cloud service and no
+account. Nothing leaves the machine, because there is nothing here that could
+send it. The whole decision is a handful of numbers computed from each 5.8 ms
+block of audio, and the audio itself is only written to a file when you ask for
+one.
+
+The honest scope. Windows only. And it does not do the dictating. It presses
+your own app's dictation shortcut for you, choosing which shortcut by looking
+at which window has focus, so it drives whatever is in front of you rather than
+one hard-wired app. A window it does not recognise gets nothing at all.
 
 | Gesture | What happens |
 |---|---|
@@ -18,6 +47,12 @@ Ctrl+D in Claude. So the job splits in two:
 You never touch the keyboard. Every state has exactly one snap leading out of
 it, so a snap is never ambiguous and you can never get stuck. See
 [The three states](#the-three-states).
+
+Under the hood the job splits in two:
+
+1. A background listener watches the mic for a finger snap.
+2. When it hears one, it presses that app's dictation key into whichever window
+   is in front.
 
 A logon scheduled task starts the listener. It then sits idle with the
 microphone closed until one of the wired apps is actually running. See
@@ -76,9 +111,11 @@ level, noise floor, brightness and decay time, but no key is sent. Adjust
 
 ### 5. Calibrate, if the defaults do not fit you
 
-The shipped `config.json` is already tuned from labelled recordings, so skip
-this unless snaps are being missed or false ones are getting through. Changing
-your mic, your room or your snapping hand is the usual reason.
+The shipped `config.json` is already tuned from labelled recordings, but they
+were made in one room, on one microphone, by one person. Skip this step if
+snaps are landing and nothing false is getting through. Do it if either of
+those stops being true. A different mic, a different room or a different
+snapping hand is the usual reason.
 
 ```bash
 python snap_to_dictate.py --calibrate
@@ -98,6 +135,25 @@ python snap_to_dictate.py
 
 Or `run.bat`, which launches it minimised. To have it start at logon instead,
 see [Autostart at logon](#autostart-at-logon).
+
+---
+
+## What you must supply yourself
+
+Four things in this repository came off one machine, in one room, and none of
+them transfers on its own. What is shipped is a worked example rather than a
+default that is correct everywhere. Each row is a thing you have to find for
+yourself before the tool will behave.
+
+| The thing | How to find yours | What breaks if it is wrong |
+|---|---|---|
+| **Your app's dictation shortcut** | The app's own settings, or its keyboard shortcut list. Nothing in this repository can tell you, because the shortcut belongs to the app and moves between releases. Once you have a candidate, confirm it against the real window with `--test-key --key ctrl+shift+v`. | The key still gets pressed. It just fires whatever the app really has bound there, in a window you are looking at. That is the failure the whole routing table exists to prevent, so never enable a profile on a shortcut nobody has confirmed. |
+| **The process name of each app you want** | `--whoami`, then click that window during the countdown. It prints the process name, the window title, which profile claims the window, and what a snap there would send. | A profile naming an image that does not exist on your machine matches nothing, so every snap in that window is ignored and `snap.log` marks it `skipped`. Install method changes the name, so a Microsoft Store package and a direct download need not agree. |
+| **Your microphone** | `--list-devices`, then put that index in `device` in `config.json`. | The listener opens an input that cannot hear you and nothing in `snap.log` explains it beyond an absence of detections. |
+| **Your detection thresholds** | `--calibrate`, or tune by hand against `--dry-run`. The shipped `config.json` was tuned in one room, on one microphone, from one person's snap. | Too tight and real snaps are dropped silently, which reads as "it works sometimes". Too loose and a keystroke near the mic can send a message you never wrote. |
+
+Once all four are in place, `--verify` checks the install end to end and exits
+non-zero if it cannot work.
 
 ---
 
@@ -123,6 +179,13 @@ What is wired out of the box:
 | VS Code | `code.exe` | none | nothing, deliberately |
 | Anything else | none | none | ignored |
 
+**Treat *Matched by* and *Sends* as this machine's answers, not yours.** The keys
+were the right ones for the app versions installed here on the day they were
+written, and an app is free to move its dictation shortcut in any release. The
+image names are what those apps were called here, and an installer can change
+that too. Check the process name with `--whoami` and the key with `--test-key`
+before you rely on either.
+
 A window that matches nothing is ignored, and that narrowness is the safety
 mechanism rather than an oversight. Ctrl+D is the Claude app's dictation
 toggle, but it is also **end of input in every terminal**, and it is how the
@@ -137,18 +200,23 @@ thing against your live config.
 
 ### Why the title matters as well as the process
 
-Measured on one machine with every app open at once:
+Measured on one machine with every app open at once. Windows hands out a fresh
+PID every time a process starts, so the actual numbers meant nothing beyond
+that one boot and there is nothing here for you to go and look for. They are
+written as labels instead, because the only thing that matters is which rows
+share one:
 
 | Window | Process | PID | Title |
 |---|---|---|---|
-| Claude desktop | `claude.exe` | 19648 | `Claude` |
-| ChatGPT | `ChatGPT.exe` | 28928 | `ChatGPT` |
-| **Codex** | `ChatGPT.exe` | **28928** | `Codex` |
-| Antigravity IDE | `Antigravity IDE.exe` | 7356 | `CODEX - Antigravity IDE` |
+| Claude desktop | `claude.exe` | A | `Claude` |
+| ChatGPT | `ChatGPT.exe` | **B** | `ChatGPT` |
+| **Codex** | `ChatGPT.exe` | **B** | `Codex` |
+| Antigravity IDE | `Antigravity IDE.exe` | C | `CODEX - Antigravity IDE` |
 
-The ChatGPT desktop app serves its chat window and its Codex window from **one
-process at one PID**. Neither the image name nor the PID separates them. The
-title is the only thing that does.
+Two rows carry the same label. The ChatGPT desktop app serves its chat window
+and its Codex window from **one process at one PID**. Neither the image name
+nor the PID separates them. The title is the only thing that does, and that is
+true on any machine even though the numbers never repeat.
 
 Title patterns are anchored, like `^Codex$`, for the reason the last row shows.
 An editor sitting on a folder named CODEX has "CODEX" in its title, and an
@@ -172,6 +240,11 @@ Only `dictation` runs the stop-side silence check, because only `dictation` has
 a stop to protect.
 
 ### Adding your own app
+
+First find the app's dictation shortcut, and find it **in the app**. It lives in
+that app's own settings, or in its keyboard shortcut list, or in its
+documentation. This tool has no way to discover it and never tries. All it can
+do is press a key you supply and let you watch what happens.
 
 Set `"enabled": false`, or leave `"activate": null`, and nothing is ever sent.
 The log still says what it would have done. Unknown shortcuts stay unset rather
@@ -218,10 +291,46 @@ $pw  = Join-Path (Split-Path $py) "pythonw.exe"
 if (-not (Test-Path $pw)) { $pw = $py }
 
 $act = New-ScheduledTaskAction -Execute $pw -Argument "`"$dir\autostart.py`"" -WorkingDirectory $dir
-$trg = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-$trg.Delay = "PT20S"
+
+# Trigger 1: at logon, so the listener is up shortly after the desktop is.
+$logon = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$logon.Delay = "PT20S"
+
+# Trigger 2: the watchdog. See "Why there are two triggers" below.
+$watch = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
+         -RepetitionInterval (New-TimeSpan -Minutes 5)
+
 $prn = New-ScheduledTaskPrincipal -UserId "$env:COMPUTERNAME\$env:USERNAME" -LogonType Interactive -RunLevel Limited
-Register-ScheduledTask -TaskName SnapToDictate -Action $act -Trigger $trg -Principal $prn -Force
+$set = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+Register-ScheduledTask -TaskName SnapToDictate -Action $act -Trigger $logon,$watch -Principal $prn -Settings $set -Force
+```
+
+### Why there are two triggers
+
+A logon trigger on its own means that if the listener ever dies, it stays dead
+until you next log in. That is not hypothetical. One died here after several
+hours because a window put a zero-width space in its title and the log line
+carrying that title could not be encoded. That particular bug is fixed at its
+root, but an unplugged microphone, a device claimed in exclusive mode, or a
+driver reset on resume can still end the listener, and none of those announce
+themselves.
+
+So the second trigger runs the launcher every five minutes, forever. Almost
+every run does nothing, because the listener holds a named event as a singleton
+and the second copy exits before it opens the microphone. The cost is one
+Python startup. The run that matters is the one after a crash, which brings the
+listener back within five minutes instead of at the next logon.
+
+It has to be a separate trigger rather than a repetition added to the logon
+one. A trigger's repetition only starts counting when that trigger fires, so a
+repeating logon trigger does nothing at all until the next logon, which is the
+exact case it was meant to cover.
+
+To check the watchdog is really scheduled, look for a `NextRunTime`. If that
+field is empty, nothing is going to fire:
+
+```powershell
+Get-ScheduledTaskInfo -TaskName SnapToDictate | Format-List LastRunTime,NextRunTime
 ```
 
 `pythonw.exe` is the console-less interpreter, which is why the task opens no
@@ -324,10 +433,13 @@ python snap_to_dictate.py --stop
   re-fire. The real constraint is the other end. Double snaps here run 76 to
   989 ms.
 - **The send snap has to be quick.** Not "snap, then snap". One gesture, both
-  snaps inside `send_window_ms`, which is 1000 ms. Measured double snaps land at
-  76 to 989 ms. The same person snapping twice *casually* lands at 2 to 7
-  seconds, which reads as stop then start again, and that is why the window is
-  where it is.
+  snaps inside `send_window_ms`, which the shipped `config.json` sets to 750 ms.
+  The built-in default is 1000 ms and applies only if you delete the key.
+  Measured double snaps here landed at 76 to 989 ms, and calibration sets the
+  window from the 95th percentile rather than the slowest one, so the rare very
+  slow pair falls outside it on purpose. The same person snapping twice
+  *casually* lands at 2 to 7 seconds, which reads as stop then start again, and
+  that is why the window is nowhere near that wide.
 - **Stopping without sending is just one snap.** Snap to stop, then leave it
   alone. After the window lapses, nothing is submitted.
 - **Keep a fallback whenever a tuning works.** `--save-good` copies the current
@@ -427,7 +539,11 @@ all 32 snaps and all 19 non-snaps on every run and prints the remaining margin,
 so a future tightening shows up as a shrinking number.
 
 If false positives still get through, switch to double-snap mode with
-`--double`. Two snaps 120 to 700 ms apart is a much rarer accident.
+`--double`. Two snaps inside the pairing window is a much rarer accident. The
+shipped `config.json` sets that window to 228 to 911 ms, derived from one
+person's natural rhythm. The built-in defaults are 120 to 700 ms. Yours come
+from `--calibrate`, so check `double_min_ms` and `double_max_ms` in your own
+config rather than trusting either pair of numbers here.
 
 ### The three states
 
@@ -443,9 +559,9 @@ If false positives still get through, switch to double-snap mode with
 ```
 
 `SETTLING` is the only state this program invented. Dictation is already off.
-What is being decided is whether to submit. It lasts `send_window_ms`, 1000 ms,
-and then lapses back to `IDLE` on its own, so a snap a few seconds after a stop
-reads as "start again" rather than "send".
+What is being decided is whether to submit. It lasts `send_window_ms`, which is
+750 ms in the shipped `config.json`, and then lapses back to `IDLE` on its own,
+so a snap a few seconds after a stop reads as "start again" rather than "send".
 
 The app shows and sounds dictation starting and stopping, so those two states
 need no help from here. `SETTLING` shows nothing, which is a real gap. An
@@ -569,7 +685,8 @@ Two details carry the result:
   Sweeping the two rates against the recording moved the gap between the classes
   from 4.1 dB to 11.4 dB.
 
-The threshold sits at 14 dB, above the loudest labelled snap rather than halfway
+The threshold, `speech_over_floor_db`, sits at 14 dB in the shipped config,
+above the loudest labelled snap rather than halfway
 between the classes. The two mistakes are not equal. A refused stop costs one
 more snap. A stop that should have been refused cuts your sentence off.
 
@@ -768,3 +885,8 @@ If you are an LLM agent asked to install, verify or modify this repository, read
 `--verify`, which exits non-zero when the tool cannot work. It also has the
 architecture with source-line citations, and four invariants that must not be
 broken. Run `python test_detector.py` before concluding a change is fine.
+
+It also has *What you can finish alone, and what you cannot*, which is the
+section to read first. Several steps here need a person to click a window,
+watch an app react, or snap into a microphone, and no agent can stand in for
+them.
