@@ -801,12 +801,24 @@ TERMINALS = frozenset({
 # makes a window unsafe is not dictation - it is the send. A double snap sends
 # Enter, and Enter is not a neutral key everywhere:
 #
-#   a terminal            runs whatever is on the command line
-#   explorer.exe          handled separately, by title - see SHELL_WINDOWS
-#   consent.exe           the UAC prompt. Enter is Yes.
-#   LogonUI.exe,          the lock screen and the credential dialogs, where
-#   CredentialUIBroker    keystrokes go into a password box
-#   Taskmgr.exe           Enter is End Task on the selected process
+#   a terminal                 runs whatever is on the command line
+#   explorer.exe               handled separately, by title - see SHELL_WINDOWS
+#   consent.exe                the UAC prompt. Enter is Yes.
+#   LogonUI.exe,               the lock screen and the credential dialogs, where
+#   CredentialUIBroker         keystrokes go into a password box
+#   Taskmgr.exe                Enter is End Task on the selected process
+#   StartMenuExperienceHost    the Start menu. Enter launches what is highlighted
+#   SearchHost, SearchApp      the search box. Enter runs the top result
+#   ShellExperienceHost        notifications and shell surfaces
+#   TextInputHost              the emoji picker, the touch keyboard and the
+#                              voice typing panel itself. This one is not a
+#                              window you dictate into, it IS the input UI
+#
+# The last four are their own processes, not explorer.exe windows, which is the
+# whole reason they are here rather than in SHELL_WINDOWS. Naming them by title
+# under explorer.exe was a real bug: the titles never matched, so the guard read
+# as covering them while the processes fell straight through to the catch-all.
+# Check the process before writing a title rule.
 #
 # Extend this rather than removing from it. An app wrongly left out gets no
 # dictation, which the log says plainly; an app wrongly let in gets a keystroke
@@ -814,21 +826,25 @@ TERMINALS = frozenset({
 NEVER_FALLBACK = TERMINALS | frozenset({
     "consent.exe", "logonui.exe", "credentialuibroker.exe",
     "taskmgr.exe", "lsass.exe", "winlogon.exe",
+    "startmenuexperiencehost.exe", "searchhost.exe", "searchapp.exe",
+    "shellexperiencehost.exe", "textinputhost.exe",
 })
 
-# explorer.exe is four different things wearing one image name, and only one of
+# explorer.exe is three different things wearing one image name, and only one of
 # them can be typed into. A folder window has a search box and a title naming
-# the folder. The desktop, the alt-tab switcher and the taskbar have no text
-# field at all, and the desktop is the foreground window whenever nothing else
-# is - so Enter there opens whichever icon happens to be selected.
+# the folder. The desktop and the alt-tab switcher have no text field at all,
+# and the desktop is the foreground window whenever nothing else is - so Enter
+# there opens whichever icon happens to be selected. The taskbar has no title.
 #
-# Windows names those three, and the names do not change with the folder the
-# user is in, so the title separates them cleanly. A folder window is allowed;
-# anything on this list, or a window with no title, is not.
-SHELL_WINDOWS = frozenset({
-    "program manager", "task switching", "start", "search",
-    "windows shell experience host", "windows input experience",
-})
+# Windows names the two that are not folders, and those names do not change
+# with the folder the user is in, so the title separates them cleanly. A folder
+# window is allowed; either of these, or a window with no title, is not.
+#
+# Only explorer.exe is checked against this. The Start menu, the search box and
+# the input panel look like shell windows but are separate processes, so they
+# are refused by name in NEVER_FALLBACK instead. Do not add a title here
+# without first confirming which process actually owns that window.
+SHELL_WINDOWS = frozenset({"program manager", "task switching"})
 
 
 def profiles_of(cfg):

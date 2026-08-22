@@ -231,11 +231,11 @@ counting the wrong thing. The event is the unit.
 |---|---|
 | what counts as a snap | `SnapDetector` gates, `snap_to_dictate.py:261` |
 | single vs double, pairing windows | `TriggerGate`, `snap_to_dictate.py:532` |
-| which key goes to which app | `resolve_profile`, `snap_to_dictate.py:838` |
-| what an app with no profile gets | `fallback_profile`, `snap_to_dictate.py:917` |
-| which windows are never typed into | `is_named_window` and `NEVER_FALLBACK`, `snap_to_dictate.py:870` |
-| which dictation a snap belongs to | `session_of`, `snap_to_dictate.py:895` |
-| how long a send stays possible, per app | `send_window_for`, `snap_to_dictate.py:2002` |
+| which key goes to which app | `resolve_profile`, `snap_to_dictate.py:854` |
+| what an app with no profile gets | `fallback_profile`, `snap_to_dictate.py:933` |
+| which windows are never typed into | `is_named_window` and `NEVER_FALLBACK`, `snap_to_dictate.py:886` |
+| which dictation a snap belongs to | `session_of`, `snap_to_dictate.py:911` |
+| how long a send stays possible, per app | `send_window_for`, `snap_to_dictate.py:2018` |
 | the dictation on/off/submit flow | `listen()` and `resolve_pending` |
 | what calibration measures | `CAL_PASSES` and `derive()`, and CALIBRATION.md with it |
 | install checks | `cmd_verify`, `snap_to_dictate.py` |
@@ -291,7 +291,7 @@ instead, and `--verify` says so.
 
 ### The catch-all
 
-`fallback_profile` (`snap_to_dictate.py:917`) builds a profile on the spot for
+`fallback_profile` (`snap_to_dictate.py:933`) builds a profile on the spot for
 any window that no entry in `profiles` claimed. It ships enabled, so an app
 nobody wired up behaves like one that was, using Windows' own voice typing.
 
@@ -310,12 +310,16 @@ The fields mean what they mean in a profile. There is no `process` or `title`,
 because not matching is the point. Everything below is load-bearing rather than
 cosmetic, and each part has tests.
 
-**It refuses 16 processes and every window it cannot identify.**
-`NEVER_FALLBACK` is the `TERMINALS` list plus six more: `consent.exe`,
+**It refuses 21 processes and every window it cannot identify.**
+`NEVER_FALLBACK` is the `TERMINALS` list plus eleven more: `consent.exe`,
 `logonui.exe`, `credentialuibroker.exe`, `taskmgr.exe`, `lsass.exe`,
-`winlogon.exe`. Terminals are there for invariant 1. The rest are there because
-`enter` in those windows clicks Yes on a UAC prompt, submits a password box or
-ends a task. `fallback_profile` also
+`winlogon.exe`, `startmenuexperiencehost.exe`, `searchhost.exe`,
+`searchapp.exe`, `shellexperiencehost.exe` and `textinputhost.exe`. Terminals
+are there for invariant 1. The rest are there because `enter` in those windows
+clicks Yes on a UAC prompt, submits a password box, ends a task, launches the
+highlighted Start menu entry or runs the top search result. `textinputhost.exe`
+is the emoji picker, the touch keyboard and the voice typing panel itself, which
+is the one process that is definitionally not a place to type into. `fallback_profile` also
 refuses any window it cannot name, and that is wider than an empty string:
 `foreground_window` reports its three failures as descriptions rather than
 `None`, so the log can say which failure it was, and `<no foreground window>`,
@@ -331,18 +335,27 @@ the refusal instead of trusting it. **Add to this list. Do not cut from it.**
 **`explorer.exe` is refused by title, not by process.** It used to sit on
 `NEVER_FALLBACK`, and that cost the user the file manager, which is the one
 place where a search box makes the gesture obviously worth having. One image
-name covers four windows: a folder window, the desktop, the alt-tab switcher and
-the taskbar. Only the folder window can be typed into, and only the desktop is
+name covers a folder window, the desktop, the alt-tab switcher and the taskbar.
+Only the folder window can be typed into, and only the desktop is
 dangerous, because it is the foreground window whenever nothing else is and
-`enter` there opens whichever icon is selected. Windows names the three that are
+`enter` there opens whichever icon is selected. Windows names the two that are
 not folders, and those names do not move with the folder the user is in, so the
-title separates them cleanly. `SHELL_WINDOWS` holds `program manager`, `task
-switching`, `start`, `search`, `windows shell experience host` and `windows
-input experience`; `fallback_profile` matches the title lowercased and stripped,
-and refuses an empty title as well, because a window with no title cannot be
-told apart from those. `--verify` and the test suite both walk the whole set. If
-you find another shell window, add it here rather than putting the process back
-on `NEVER_FALLBACK`.
+title separates them cleanly. `SHELL_WINDOWS` holds `program manager` and `task
+switching`; `fallback_profile` matches the title lowercased and stripped, and
+refuses an empty title as well, because the taskbar has none and neither does a
+window whose title could not be read. `--verify` and the test suite both walk
+the whole set.
+
+**`SHELL_WINDOWS` is consulted for `explorer.exe` and nothing else, so a title
+in it that belongs to another process is dead weight that reads as a guard.**
+That happened. `start`, `search`, `windows shell experience host` and `windows
+input experience` were written here first, and every one of them is a separate
+process: `StartMenuExperienceHost.exe`, `SearchHost.exe`,
+`ShellExperienceHost.exe`, `TextInputHost.exe`. The titles never matched under
+`explorer.exe`, so the four windows they were meant to stop went straight to the
+catch-all while the code read as though they were covered. They are on
+`NEVER_FALLBACK` by process now, with a test per name. Confirm which process
+owns a window before you write a title rule about it.
 
 **Each window gets its own profile name**, `Windows voice typing [chrome.exe]`.
 `send_key_if_focused` re-checks focus by comparing profile **names**, and that
@@ -379,7 +392,7 @@ it was, so a refused start does not put the loop into `RECORDING` waiting to
 stop a dictation that never began.
 
 **Its send window is its own, and wider.** A profile may carry its own
-`send_window_ms`; `send_window_for` (`snap_to_dictate.py:2002`) returns that
+`send_window_ms`; `send_window_for` (`snap_to_dictate.py:2018`) returns that
 when it is set and the global value otherwise, and `classify` now takes the
 profile so `SETTLING` can ask. The catch-all sets 2500 ms against a global 750 ms, because
 Windows voice typing is cloud recognition: the audio goes to Microsoft, the

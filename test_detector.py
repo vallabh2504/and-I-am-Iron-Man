@@ -1032,6 +1032,23 @@ check("a folder window is allowed, so its search box can be dictated into",
 check("...and carries explorer.exe in its name like any other unwired app",
       "explorer.exe" in route_all("explorer.exe", "Downloads")["name"], True)
 
+# The Start menu, the search box, the notification surfaces and the input panel
+# look like shell windows and were briefly written as explorer.exe titles. They
+# are separate processes, so those titles never matched and the guard covered
+# nothing while reading as though it did. They are refused by process now, and
+# each is checked by name so the mistake cannot come back quietly.
+for _p in ("startmenuexperiencehost.exe", "searchhost.exe", "searchapp.exe",
+           "shellexperiencehost.exe", "textinputhost.exe"):
+    check("%s is refused by process, not by title" % _p, route_all(_p, ""), None)
+    check("...whatever title it carries", route_all(_p, "Windows Input Experience"),
+          None)
+    check("...and it is on the refusal list itself", _p in _s.NEVER_FALLBACK, True)
+# The corollary: SHELL_WINDOWS is only ever consulted for explorer.exe, so a
+# title in it that belongs to some other process is dead weight that reads as a
+# guard. Every entry has to be a window explorer.exe actually owns.
+check("SHELL_WINDOWS holds only titles explorer.exe really owns",
+      set(_s.SHELL_WINDOWS), {"program manager", "task switching"})
+
 # An app that IS wired keeps its own key. The catch-all is a last resort, not
 # an override, or a snap in Claude would press the system key instead of ctrl+d.
 check("a wired app still uses its own shortcut",

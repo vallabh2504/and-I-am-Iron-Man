@@ -253,10 +253,14 @@ send. A double snap presses Enter, and Enter is not a harmless key everywhere:
 | `consent.exe` | the UAC prompt, where Enter is Yes |
 | `LogonUI.exe`, `CredentialUIBroker.exe` | the lock screen and credential dialogs, where keystrokes go into a password box |
 | `Taskmgr.exe` | End Task on whatever is selected |
+| `StartMenuExperienceHost.exe` | launches whichever app is highlighted in the Start menu |
+| `SearchHost.exe`, `SearchApp.exe` | runs the top search result |
+| `ShellExperienceHost.exe` | activates whatever notification or shell surface is focused |
+| `TextInputHost.exe` | the emoji picker, the touch keyboard and the voice typing panel itself, which is input UI rather than somewhere to put input |
 
-Sixteen processes are refused outright, and `explorer.exe` is refused by title
-rather than by process, for the reason under *Explorer is four windows wearing
-one name*. A window whose process cannot be
+Twenty-one processes are refused outright, and `explorer.exe` is refused by
+title rather than by process, for the reason under *Explorer is three windows
+wearing one name*. A window whose process cannot be
 identified is refused as well, because a window that cannot be named cannot be
 vouched for, and "cannot be named" covers more than an empty string. When there
 is no foreground window at all, when the session is locked, or when the window
@@ -286,30 +290,39 @@ dictation". They are not the same question.
 To turn the whole thing off, set `"enabled": false` on the `fallback` block, or
 clear its `activate`. Either one silences every unwired app.
 
-### Explorer is four windows wearing one name
+### Explorer is three windows wearing one name
 
 `explorer.exe` is the file manager, and it is also the desktop, the alt-tab
-switcher and the taskbar. One image name, four windows, and only the first of
-them has anywhere to put text. A folder window has a search box and a title
+switcher and the taskbar. One image name, several windows, and only the file
+manager has anywhere to put text. A folder window has a search box and a title
 naming the folder. The desktop has no text field at all and is the foreground
 window whenever nothing else is, so an Enter there opens whichever icon happens
 to be selected.
 
-The title separates them cleanly, because Windows names the three that are not
-folders and those names do not change with the folder you are looking at:
+The title separates them, because Windows names the two that are not folders
+and those names do not change with the folder you are looking at:
 
 | Title | What the catch-all does |
 |---|---|
 | `Downloads`, `Documents`, any folder name | allowed, and `ctrl+space` reaches the search box |
 | `Program Manager` | the desktop, refused |
 | `Task Switching` | alt-tab, refused |
-| `Start`, `Search` | refused |
-| `Windows Shell Experience Host`, `Windows Input Experience` | refused |
-| empty | refused, because a window with no title cannot be told apart from those |
+| empty | refused; the taskbar has no title, and neither does a window we cannot read |
 
-That list is `SHELL_WINDOWS` in the source. `--verify` walks every entry of it
-against your live config rather than trusting that the code still matches this
-table.
+That list is `SHELL_WINDOWS` in the source, and it holds those two titles only.
+`--verify` walks every entry against your live config rather than trusting that
+the code still matches this table.
+
+**The Start menu, the search box, the notification surfaces and the emoji panel
+are not Explorer.** They look like shell windows and it is tempting to name them
+here, but each is its own process: `StartMenuExperienceHost.exe`,
+`SearchHost.exe`, `SearchApp.exe`, `ShellExperienceHost.exe` and
+`TextInputHost.exe`. Written as Explorer titles they would never match, so the
+guard would read as covering them while every one of them fell through to the
+catch-all. They are on the refusal list by process instead. Enter in the Start
+menu launches whatever is highlighted and Enter in the search box runs the top
+result, so this is not a cosmetic distinction. Confirm which process owns a
+window before writing a rule about it.
 
 ### What Windows voice typing actually is
 
