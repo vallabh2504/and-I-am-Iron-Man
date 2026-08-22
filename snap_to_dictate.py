@@ -67,6 +67,7 @@ DEFAULTS = {
     "min_decay_ms": 30.0,         # must take at least this long; rejects ticks
     "max_decay_ms": 160.0,        # must decay within this; rejects sustained sound
     "refractory_ms": 220.0,       # deaf time after an accepted snap
+    "pair_refractory_ms": 60.0,   # ...but only this much while a send may follow
     "reject_refractory_ms": 12.0, # deaf time after a rejected transient
 
     # --- how many snaps make a trigger ---
@@ -257,6 +258,8 @@ class SnapDetector:
 
         self.max_decay_blocks = max(1, int(cfg["max_decay_ms"] / self.block_ms))
         self.refractory_blocks = int(cfg["refractory_ms"] / self.block_ms)
+        self.pair_refractory_blocks = max(
+            1, int(cfg["pair_refractory_ms"] / self.block_ms))
         self.reject_refractory_blocks = max(
             1, int(cfg["reject_refractory_ms"] / self.block_ms))
         self.abs_floor = 10.0 ** (cfg["abs_floor_db"] / 10.0)
@@ -410,6 +413,30 @@ class SnapDetector:
         self.state = self.IDLE
         self.cooldown = (self.refractory_blocks if accepted
                          else self.reject_refractory_blocks)
+
+    def expect_pair(self):
+        """Cut the current deaf time short because a confirming snap may follow.
+
+        The refractory nominally has two jobs: stopping a snap's own tail from
+        registering twice, and stopping a person from firing three gestures in
+        a second. 220 ms is set for the second. The moment a stop lands the
+        second job is actively wrong - the snap that confirms a send arrives as
+        fast as fingers move, well inside 220 ms, so the detector was deaf for
+        the whole of it. The second snap of a natural double was not rejected;
+        it was never heard, which is why nothing appeared in the log at all.
+
+        The first job turns out not to need the refractory. Sweeping it from
+        220 ms down to 30 ms across a 350-second recording changed the detection
+        count by exactly one, stable the whole way down: a decaying tail never
+        presents the rise the onset logic looks for, so it cannot re-fire. That
+        one extra detection is the second snap of a double that 220 ms had been
+        eating.
+
+        60 ms is set from the double-snap gaps measured on this machine, which
+        run 76-989 ms. Calibration measures that distribution properly; until it
+        does, this sits below the fastest pair anyone here has produced.
+        """
+        self.cooldown = min(self.cooldown, self.pair_refractory_blocks)
 
     def push(self, block):
         self._remember(block)
@@ -736,6 +763,39 @@ def profile_ready(prof):
     return bool(prof and prof.get("enabled") and prof.get("activate"))
 
 
+def send_key_if_focused(mod_vks, key_vk, prof, cfg, what):
+    """Press a key only if the window that earned it is still in front.
+
+    Every other send in this file happens in the same breath as the focus check
+    that authorised it, so the check and the keystroke cannot disagree. Three
+    sends are different: a held stop waits up to PENDING_TIMEOUT_MS for the room
+    to go quiet, and a submit waits send_delay_ms for the transcript to land.
+    Focus can move during either wait, and without this the keystroke follows
+    the profile that started the gesture rather than the window now in front.
+
+    That is the exact failure the whole routing table exists to prevent. ctrl+d
+    is dictation in the Claude desktop app and end-of-input in every shell, so a
+    stop arriving 300 ms late in a terminal closes it. The window is re-read
+    here, immediately before the press, so the gap between deciding and sending
+    is as small as it can be made.
+
+    Matching is by profile name, not process, because two profiles can share one
+    executable - ChatGPT and Codex are one process at one PID, separated only by
+    their titles. Name is the identity the rest of the loop already uses.
+
+    Returns True if the key was sent.
+    """
+    exe, title = foreground_window()
+    now = resolve_profile(exe, title, cfg)
+    if now is not None and now["name"] == prof["name"]:
+        send_key(mod_vks, key_vk)
+        return True
+    where = "%s%s" % (exe, (" [%s]" % title) if title else "")
+    print("[%s] dropped %s for %s; focus moved to %s"
+          % (time.strftime("%H:%M:%S"), what, prof["name"], where))
+    return False
+
+
 def watch_set(cfg):
     """Image names worth holding the microphone open for.
 
@@ -882,36 +942,744 @@ def collect_hf(cfg, seconds, label):
     return np.array(values)
 
 
+# --------------------------------------------------------------- calibration
+#
+# Six recorded passes, then every threshold derived offline from the recording.
+# Nothing is decided live, so a pass can be re-run without redoing the others,
+# and two candidate configs can be compared on identical audio afterwards.
+#
+# The routine this replaces took the five loudest analysis BLOCKS and called
+# them five snaps. A block is 5.8 ms and a snap decays over roughly 160 ms, so
+# one snap spans about 27 of them - which meant all five "peaks" came from the
+# single loudest snap in the take, and "the weakest snap" was really that one
+# snap's fifth-loudest block. The derived floor sat far too high, and a floor
+# set too high does not error: it silently drops real snaps and the user
+# concludes the tool is unreliable.
+#
+# Everything below groups blocks into snap events before measuring anything,
+# which is what SnapDetector.push already does correctly.
+
+CAL_DIR = Path(__file__).resolve().parent / "calibration"
+
+CAL_PASSES = [
+    {"key": "room", "seconds": 15.0, "title": "Room floor", "expect": 0,
+     "ask": "Sit as you normally would and stay quiet.",
+     "why": "Measuring the room with you in it - your breathing, your chair."},
+    {"key": "snaps_close", "seconds": 24.0, "title": "Close snaps", "expect": 10,
+     "ask": "Snap 10 times, about two seconds apart, from where you sit.",
+     "why": "Normal hand, normal distance. Do not lean toward the mic."},
+    {"key": "snaps_far", "seconds": 24.0, "title": "Far snaps", "expect": 10,
+     "ask": "Stand up. Snap 10 times from across the room.",
+     "why": "Deliberately your weakest snaps - that is the whole point."},
+    {"key": "speech", "seconds": 60.0, "title": "Your voice", "expect": 0,
+     "ask": "Talk continuously for a minute. Do NOT snap.",
+     "why": "Plosives (p t k b d) are the sounds that impersonate a snap."},
+    {"key": "noises", "seconds": 30.0, "title": "Room noises", "expect": 0,
+     "ask": "Type, click, shift in your chair, set a cup down. No talking.",
+     "why": "Include the fan or the door if they are part of this room."},
+    {"key": "doubles", "seconds": 34.0, "title": "Double snaps", "expect": 20,
+     "ask": "Snap twice, ten times over, at your natural rhythm.",
+     "why": "Do not count it out. This measures the timing you really produce."},
+    {"key": "stop_gesture", "seconds": 50.0, "title": "Stop gesture", "expect": 8,
+     "ask": "Talk a few seconds, snap once, stop talking. Repeat 8 times.",
+     "why": "The only pass that performs the real gesture, so the only one "
+            "where both sides are measured against the same floor."},
+]
+
+PAIR_MAX_MS = 1200.0    # a longer gap separates two pairs, it is not one pair
+SNAPS_PER_PASS = 10     # what CAL_PASSES asks for in each of the two snap passes
+STOP_QUIET_DB = 12.0    # above this, the speaker had not stopped talking yet
+STOP_GESTURES = 8       # ...and in the stop-gesture pass
+
+
+def permissive(cfg):
+    """cfg with the level gates opened wide and the shape gates only relaxed.
+
+    The distinction is the whole point, and getting it wrong was measured
+    rather than guessed. Calibration exists to derive the LEVEL gates - how
+    loud a snap is here, against this floor, from this distance - so those open
+    all the way: a weak snap the current floor rejects is exactly what has to
+    be seen. The SHAPE gates are different. That a snap stays bright as it
+    fades is physics, not a property of the room, and it is the only feature
+    that separates a snap from a footstep.
+
+    Opening the shape gates too turns the detector into a transient counter.
+    On the first real six-pass recording, tail_hf_ratio_min at 0.05 found 31
+    events in a pass containing 10 snaps: the genuine ones sat at tail_hf
+    0.62-0.99 and the other 21 - chair, footsteps, clothing while standing up
+    for the far pass - sat at 0.56 and below. Every derived threshold was then
+    a percentile over mostly-not-snaps, which collapsed the brightness gates to
+    nothing and failed three of the five acceptance checks at once.
+
+    0.55 sits below the weakest genuine snap in that recording and above the
+    loudest thing that was not one. Sweeping it from 0.55 to 0.62 left the
+    weakest detected snap stable at -13.9 dB, so the value is not balanced on
+    a knife edge.
+    """
+    loose = dict(cfg)
+    loose.update({"abs_floor_db": -80.0, "noise_ratio_thresh": 2.5,
+                  "hf_ratio_min": 0.15, "tail_hf_ratio_min": 0.55,
+                  "min_decay_ms": 8.0, "max_decay_ms": 250.0,
+                  "refractory_ms": 80.0, "pair_refractory_ms": 80.0})
+    return loose
+
+
+ISOLATION_MS = 400.0   # closer than this and two transients are one burst
+TAIL_FLOOR = 0.60      # below this a transient is not shaped like a snap at all
+
+
+def snap_set(events, expected):
+    """The transients in a snap pass that are actually snaps, in time order.
+
+    Two properties separate a snap from the things that share a room with one,
+    and this uses both. Shape: a snap stays bright as it fades, so tail_hf sits
+    high. Isolation: a snap is performed alone, a second or two from the next,
+    while the things mistaken for one arrive in bursts - a run of keystrokes, a
+    chair scraping, a snap's own reflection off a hard wall.
+
+    The count is a hint, never a cut. An earlier version ranked by tail_hf and
+    kept exactly `expected`, which works only for as long as the extras really
+    are junk. On a clean recording it fails badly. The close pass held twelve
+    transients on a metronomic two-second cadence with nothing clustered - that
+    is twelve snaps from someone who kept going past ten - and keeping the top
+    ten discarded two real ones, then reported that the two discarded looked
+    just like the ten kept. They did. Every one of them was a snap. Punishing
+    the cleanest possible recording is the wrong way round, so the count is now
+    only checked for being in the right neighbourhood.
+
+    Returns the kept events and a note naming what was dropped and why.
+    """
+    ranked = sorted(events, key=lambda e: e["onset_block"])
+    dim = [e for e in ranked if e["tail_hf"] < TAIL_FLOOR]
+    bright = [e for e in ranked if e["tail_hf"] >= TAIL_FLOOR]
+
+    # Within a burst keep the brightest and drop the neighbour: a snap heard
+    # twice off a wall should cost the reflection, not the snap.
+    kept, crowded = [], []
+    for e in bright:
+        if kept and (e["t_s"] - kept[-1]["t_s"]) * 1000.0 < ISOLATION_MS:
+            loser = e if e["tail_hf"] <= kept[-1]["tail_hf"] else kept.pop()
+            crowded.append(loser)
+            if loser is e:
+                continue
+        kept.append(e)
+
+    bits = []
+    if dim:
+        bits.append("%d too dull" % len(dim))
+    if crowded:
+        bits.append("%d too close to a neighbour" % len(crowded))
+    return kept, (", ".join(bits) if bits else "nothing dropped")
+
+
+def trigger_count(audio, cfg, warmup=None):
+    """How many sends this config would actually produce from this audio.
+
+    events_in reports what the detector heard; this reports what the user would
+    have seen happen, which is the same thing only when pairing, refractory and
+    the send window all cooperate.
+    """
+    n = cfg["blocksize"]
+    det = SnapDetector(cfg)
+    gate = TriggerGate(cfg, det.block_ms)
+    if warmup is not None:
+        for i in range(0, len(warmup) - n, n):
+            det.push(warmup[i:i + n])
+    sent = 0
+    for i in range(0, len(audio) - n, n):
+        ev = det.push(audio[i:i + n])
+        if ev and gate.offer(ev):
+            sent += 1
+    return sent
+
+
+def stop_snaps_from(events):
+    """The stop-gesture transients that were followed by silence, plus the gap.
+
+    The pass instructs: talk, snap once, stop talking. So the snap is not the
+    brightest thing in the rep - it is the one with quiet on the far side of it.
+    That is a label the user performed rather than a threshold this code picked,
+    and it lands the pass in two obvious groups. On the first recording to carry
+    this pass the quiet side read 1.7, 3.9, 5.0, 7.3 dB and the next value was
+    18.9: an 11.6 dB canyon between four clean gestures and ten transients from
+    the middle of a sentence.
+
+    An earlier version ranked these by tail_hf like the snap passes, kept eight,
+    and took the loudest - which stepped across the canyon, picked up a mid-
+    sentence transient, and set speech_over_floor_db to 32.8 dB instead of 10.3.
+    A threshold is only as good as the side of the gap it is measured on.
+
+    Cutting at the widest gap also reports an honestly botched pass. Eight reps
+    were asked for and four came back clean; deriving from those four is right,
+    because a rep where the user never stopped talking describes nothing.
+
+    Returns the quiet-side events and the width of the gap they were cut at.
+    """
+    have = [e for e in events if e.get("speech_after_db") is not None]
+    if len(have) < 2:
+        return have, float("nan")
+    ranked = sorted(have, key=lambda e: e["speech_after_db"])
+    lv = [e["speech_after_db"] for e in ranked]
+    # Every rep clean is a real outcome, not a missing gap. Cutting at the
+    # widest step in a run of uniformly quiet values would keep two of eight
+    # and call the other six mid-sentence, which is the same mistake as taking
+    # the ten most snap-like transients out of twelve genuine snaps.
+    if max(lv) < STOP_QUIET_DB:
+        return ranked, float("inf")
+    width, at = max((lv[i + 1] - lv[i], i) for i in range(len(lv) - 1))
+    return ranked[:at + 1], width
+
+
+def events_in(audio, cfg, warmup=None):
+    """Every transient in `audio`, as snap events with their five features.
+
+    `warmup` seeds the detector's noise floor - the room pass, normally - so a
+    take that opens with a snap is not measured against a floor estimated from
+    that snap. Blocks fed as warmup do not produce events.
+
+    Each event also carries `speech_after_db`, the speech-band level in the
+    window after its onset. That is measured as the pass plays rather than at
+    the end, because the detector's speech history is a bounded deque and a
+    question asked too late gets None instead of a wrong answer.
+    """
+    det = SnapDetector(cfg)
+    n = cfg["blocksize"]
+    lo_ms, hi_ms = cfg["speech_window_ms"]
+    skip = 0
+    if warmup is not None:
+        for i in range(0, len(warmup) - n + 1, n):
+            det.push(warmup[i:i + n])
+            skip += 1
+
+    out, waiting = [], []
+
+    def settle(force=False):
+        still = []
+        for ev in waiting:
+            level = det.speech_db(ev["onset_block"], lo_ms, hi_ms)
+            if level is None and not force:
+                still.append(ev)
+                continue
+            ev["speech_after_db"] = level
+            out.append(ev)
+        waiting[:] = still
+
+    for i in range(0, len(audio) - n + 1, n):
+        ev = det.push(audio[i:i + n])
+        if ev is not None:
+            ev = dict(ev)
+            ev["t_s"] = (ev["onset_block"] - skip) * n / float(cfg["samplerate"])
+            waiting.append(ev)
+        settle()
+    settle(force=True)
+    out.sort(key=lambda e: e["onset_block"])
+    return out
+
+
+def band_floor_db(audio, cfg, mask_name):
+    """Median per-block level of one frequency band, in dB."""
+    det = SnapDetector(cfg)
+    n = cfg["blocksize"]
+    vals = []
+    for i in range(0, len(audio) - n + 1, n):
+        hf, _ = det.features(audio[i:i + n])
+        vals.append(hf if mask_name == "hf" else det.last_speech)
+    return db(float(np.median(vals))) if vals else float("nan")
+
+
+def record_pass(cfg, seconds, title):
+    """Record one pass with a live countdown. Returns float32 mono."""
+    q = queue.Queue()
+    chunks = []
+
+    def cb(indata, frames, time_info, status):
+        q.put(indata[:, 0].copy())
+
+    with open_stream(cfg, cb):
+        start = time.monotonic()
+        shown = -1
+        while True:
+            left = seconds - (time.monotonic() - start)
+            if left <= 0:
+                break
+            whole = int(left) + 1
+            if whole != shown:
+                bar = "#" * int(28 * (1 - left / seconds))
+                print("\r    [%-28s] %3d s " % (bar, whole), end="", flush=True)
+                shown = whole
+            try:
+                chunks.append(q.get(timeout=0.2))
+            except queue.Empty:
+                pass
+        while True:                       # whatever the driver still holds
+            try:
+                chunks.append(q.get_nowait())
+            except queue.Empty:
+                break
+    print("\r    [%-28s] done. %s" % ("#" * 28, " " * 6))
+    return (np.concatenate(chunks) if chunks
+            else np.zeros(0, dtype=np.float32))
+
+
+def write_wav(path, audio, samplerate):
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(int(samplerate))
+        w.writeframes((np.clip(audio, -1.0, 1.0) * 32767.0)
+                      .astype("<i2").tobytes())
+
+
 def cmd_calibrate(cfg, config_path):
-    print("Calibration - sit where you normally sit.\n")
-    time.sleep(0.4)
-    quiet = collect_hf(cfg, 3.0, "Stay quiet for 3 seconds...")
-    noise = float(np.median(quiet))
-    print("    noise floor: %.1f dB\n" % db(noise))
+    """Run the six passes, then derive. See CALIBRATION.md."""
+    print("=" * 68)
+    print("  Calibration - six passes, about four minutes.")
+    print("  Nothing is decided while you record. Every threshold is derived")
+    print("  afterwards from the recording, so a pass can be re-run alone.")
+    print("=" * 68)
 
-    time.sleep(0.6)
-    snaps = collect_hf(cfg, 8.0, "Now snap 5 times, about a second apart...")
-    peaks = np.sort(snaps)[-5:]
-    weakest = float(peaks[0])
-    print("    5 loudest transients: %s dB" % ["%.1f" % db(p) for p in peaks])
-    print("    weakest snap: %.1f dB\n" % db(weakest))
+    dev = cfg.get("device")
+    print("\n  Input device: %s" % ("system default" if dev is None else dev))
+    print("  Sit where you normally sit. Press Enter when you are ready.")
+    try:
+        input()
+    except EOFError:
+        pass
 
-    headroom_db = db(weakest) - db(noise)
-    if headroom_db < 12:
-        print("    WARNING: only %.1f dB between noise and snap." % headroom_db)
-        print("    Snap closer to the mic, or quiet the room, and re-run.\n")
+    audio = {}
+    for i, p in enumerate(CAL_PASSES, 1):
+        print("\n" + "-" * 68)
+        print("  Pass %d of 6 - %s   (%d s)" % (i, p["title"], int(p["seconds"])))
+        print("  %s" % p["ask"])
+        print("  %s" % p["why"])
+        print("-" * 68)
+        for c in (3, 2, 1):
+            print("    starting in %d..." % c, flush=True)
+            time.sleep(1.0)
+        audio[p["key"]] = record_pass(cfg, p["seconds"], p["title"])
 
-    # Put the threshold at the geometric mean of noise floor and weakest snap,
-    # i.e. halfway between them in dB - equal margin against both mistakes.
-    ratio = float(np.sqrt(weakest / max(noise, EPS)))
-    cfg["noise_ratio_thresh"] = round(min(max(ratio, 6.0), 300.0), 2)
-    cfg["abs_floor_db"] = round(db(noise) + headroom_db * 0.35, 1)
+    CAL_DIR.mkdir(exist_ok=True)
+    stamp = time.strftime("%Y-%m-%d-%H%M")
+    wav_path = CAL_DIR / ("%s.wav" % stamp)
+    bounds, joined, at = {}, [], 0
+    for p in CAL_PASSES:
+        a = audio[p["key"]]
+        bounds[p["key"]] = [at, at + len(a)]
+        joined.append(a)
+        at += len(a)
+    write_wav(wav_path, np.concatenate(joined), cfg["samplerate"])
+    (CAL_DIR / ("%s.passes.json" % stamp)).write_text(
+        json.dumps({"samplerate": cfg["samplerate"], "bounds": bounds},
+                   indent=2), encoding="utf-8")
+    print("\n  Recorded %s (%.1f s)" % (wav_path.name, at / cfg["samplerate"]))
 
-    config_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-    print("    noise_ratio_thresh = %s" % cfg["noise_ratio_thresh"])
-    print("    abs_floor_db       = %s" % cfg["abs_floor_db"])
-    print("\nWrote %s" % config_path)
-    print("Next: python snap_to_dictate.py --dry-run")
+    return derive(cfg, audio, config_path, wav_path, stamp)
+
+
+def cmd_derive(cfg, wav_path, config_path):
+    """Re-derive from a recording made earlier, with nobody in the room.
+
+    This is what makes the recording worth keeping. A rule can be changed and
+    judged against the exact audio that produced the last set of complaints,
+    instead of against a fresh performance that differs in a dozen
+    uncontrolled ways.
+    """
+    sidecar = wav_path.with_suffix("").with_suffix(".passes.json")
+    if not sidecar.exists():
+        sidecar = wav_path.with_name(wav_path.stem + ".passes.json")
+    if not sidecar.exists():
+        print("No pass boundaries beside %s. A calibration recording is a WAV"
+              % wav_path.name)
+        print("plus a .passes.json naming where each pass starts and ends;")
+        print("without it there is no way to tell the speech pass from the")
+        print("snap pass. Re-run --calibrate.")
+        return 1
+
+    meta = json.loads(sidecar.read_text(encoding="utf-8"))
+    with wave.open(str(wav_path), "rb") as w:
+        raw = w.readframes(w.getnframes())
+        rate = w.getframerate()
+    all_audio = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    if rate != cfg["samplerate"]:
+        print("WARNING: %s is %d Hz but the config says %d; every millisecond "
+              "below will be off." % (wav_path.name, rate, cfg["samplerate"]))
+    audio = {k: all_audio[a:b] for k, (a, b) in meta["bounds"].items()}
+    stamp = wav_path.stem
+    print("Re-deriving from %s (%.1f s)" % (wav_path.name, len(all_audio) / rate))
+    return derive(cfg, audio, config_path, wav_path, stamp)
+
+
+def derive(cfg, audio, config_path, wav_path, stamp):
+    """Turn six recorded passes into a config, or refuse and say why.
+
+    Stated as rules rather than magic numbers, so any config this writes can be
+    audited against the recording that produced it.
+    """
+    loose = permissive(cfg)
+    room = audio["room"]
+    ev = {k: events_in(audio[k], loose, warmup=room)
+          for k in ("snaps_close", "snaps_far", "speech", "noises", "doubles")
+          if k in audio}
+    # Recordings made before the stop-gesture pass existed are still readable;
+    # they simply cannot answer the question that pass was added to answer.
+    has_stop = "stop_gesture" in audio and len(audio["stop_gesture"]) > 0
+    if has_stop:
+        ev["stop_gesture"] = events_in(audio["stop_gesture"], loose, warmup=room)
+
+    # The snap passes get ranked down to the count that was actually performed.
+    # The other passes do not: every transient in the speech and noise passes is
+    # a negative example by definition, and throwing any of them away would be
+    # throwing away the evidence the gates are built from.
+    close, note_close = snap_set(ev["snaps_close"], SNAPS_PER_PASS)
+    far, note_far = snap_set(ev["snaps_far"], SNAPS_PER_PASS)
+    snaps = close + far
+
+    print("\n" + "=" * 68)
+    print("  What the recording contains")
+    print("=" * 68)
+    for p in CAL_PASSES[1:]:
+        if p["key"] not in ev:
+            print("    %-14s  not in this recording" % p["title"])
+            continue
+        got = len(ev[p["key"]])
+        if p["key"] in ("snaps_close", "snaps_far"):
+            usable, note = ((close, note_close) if p["key"] == "snaps_close"
+                            else (far, note_far))
+            print("    %-14s %3d transient(s)  -> %d snap(s), %s"
+                  % (p["title"], got, len(usable), note))
+        else:
+            note = "" if not p["expect"] else "  (expected about %d)" % p["expect"]
+            print("    %-14s %3d transient(s)%s" % (p["title"], got, note))
+    floor_hf = band_floor_db(room, cfg, "hf")
+    floor_sp = band_floor_db(room, cfg, "speech")
+    print("    %-14s hf %.1f dB   speech-band %.1f dB"
+          % ("Room floor", floor_hf, floor_sp))
+
+    fatal = []
+    if floor_hf > -30.0:
+        fatal.append("The room floor is %.1f dB, above -30. Turn the input gain "
+                     "down or quiet the room, then re-run." % floor_hf)
+    if floor_hf < -80.0:
+        fatal.append("The room floor is %.1f dB, below -80. The mic is muted or "
+                     "the wrong device is selected." % floor_hf)
+    # A range, not a count. Snapping eleven or twelve times in a pass that asks
+    # for ten is not an error and must not be treated as one; what matters is
+    # that the pass yielded enough real snaps to describe the distribution, and
+    # not so many that something in the room is being counted as a snap.
+    for name, usable, hint in (
+            ("close", close, "Snap once every second or two and leave the rest "
+                             "of the room alone while the pass runs."),
+            ("far", far, "Get into position, stand still, then snap - moving "
+                         "about makes more noise than a far snap does.")):
+        if len(usable) < 6:
+            fatal.append("The %s pass yielded only %d usable snaps. %s"
+                         % (name, len(usable), hint))
+        elif len(usable) > SNAPS_PER_PASS * 1.8:
+            fatal.append("The %s pass yielded %d usable snaps where it asked "
+                         "for %d, so something in the room is snap-shaped and "
+                         "is being counted as one. %s"
+                         % (name, len(usable), SNAPS_PER_PASS, hint))
+    if len(ev["snaps_close"]) < 8:
+        fatal.append("Only %d of 10 close snaps registered even wide open. That "
+                     "is hardware, not tuning - the mic is too far, the gain is "
+                     "too low, or it is the wrong device."
+                     % len(ev["snaps_close"]))
+    if len(ev["snaps_far"]) < 6:
+        fatal.append("Only %d of 10 far snaps registered. The room is too big "
+                     "for this mic; the working range has to be stated rather "
+                     "than tuned around." % len(ev["snaps_far"]))
+    if not ev["speech"]:
+        fatal.append("No transients at all in the speech pass, so there is no "
+                     "negative set to work from. Re-run it and talk more.")
+    if not has_stop:
+        fatal.append("This recording has no stop-gesture pass, so the margin "
+                     "between a real stop and mid-sentence cannot be measured "
+                     "against the floor that applies when it matters. Re-run "
+                     "--calibrate to record all seven passes.")
+    if fatal:
+        print("\n" + "=" * 68)
+        print("  Cannot derive a config")
+        print("=" * 68)
+        for f in fatal:
+            print("    - %s" % f)
+        print("\n  %s is unchanged. The recording is kept at %s"
+              % (config_path.name, wav_path.name))
+        return 1
+
+    # ---- the rules ---------------------------------------------------------
+    peaks = [e["peak_db"] for e in snaps]
+    weakest = min(peaks)
+    # Set from the weakest snap, not the average. The two mistakes cost
+    # differently: a floor set low lets in a room noise the later gates then
+    # reject, while a floor set high silently drops real snaps and logs nothing.
+    abs_floor = max(round(weakest - 4.0, 1), round(floor_hf + 12.0, 1))
+
+    # hf_ratio_min, tail_hf_ratio_min and the decay bounds are deliberately NOT
+    # derived. They describe the shape of a snap - that it arrives instantly,
+    # stays bright as it fades, and is over inside a fifth of a second - which
+    # is physics, the same in every room. Levels and timings are what a room,
+    # a mic and a person change, and those are what this derives.
+    #
+    # It was tried the other way and the result was worse on both counts. It is
+    # circular: the snap set is chosen using the very features being fitted to
+    # it, so the gate can only ever loosen. And the measurement it fits is not
+    # sound - onset_hf is read at onset_block, which sits before the transient
+    # whenever the attack is slow, so it reports the room instead of the snap.
+    # Every far snap has a slow measured attack, because at that distance the
+    # level climbs through reflections rather than arriving at once: one read
+    # onset_hf 0.16 with a tail_hf of 0.98. Fitting to that pulled hf_ratio_min
+    # from 0.45 down to 0.162, and the acceptance gate caught what followed.
+    #
+    # The shipped values are tuned against a labelled field log with confirmed
+    # ground truth, which is the evidence an unlabelled 24-second pass cannot
+    # offer. If they do not fit this room, acceptance checks 1 and 2 fail and
+    # nothing is written - the honest inverse of loosening a gate until it fits.
+
+    # Both sides come from audio where the speaker has been talking, so both
+    # are measured against an elevated floor. Taking the quiet side from the
+    # snap passes instead - where the floor sits 38 dB lower - is what made the
+    # first version of this check report a negative margin on well-separated
+    # audio. The stop gesture is the only pass that reproduces the real moment.
+    if has_stop:
+        stop_snaps, stop_gap = stop_snaps_from(ev["stop_gesture"])
+    else:
+        stop_snaps, stop_gap = [], float("nan")
+    quiet_after = [e["speech_after_db"] for e in stop_snaps
+                   if e.get("speech_after_db") is not None]
+    speech_after = [e["speech_after_db"] for e in ev["speech"]
+                    if e.get("speech_after_db") is not None]
+    # Placed above the loudest post-snap quiet, not midway to speech. A stop
+    # that fires when it should not have cuts a sentence in half; a stop that
+    # is refused costs one more snap. The asymmetry is deliberate.
+    # Derived only from a pass that was actually performed. Four clean reps is
+    # not enough to see the top of the distribution, and a threshold fitted to
+    # the largest of four is tighter than the truth: this recording gave 4 of 8
+    # and derived 10.3 dB, while a separately labelled recording holds genuine
+    # snap-stops up to 10.6. Under-shooting is the safe direction - a stop below
+    # the line is held, not lost, and fires when the room goes quiet - but it is
+    # still a stop the user has to wait for, and silently narrowing a working
+    # threshold on four samples is not what calibration is for.
+    enough = len(quiet_after) >= STOP_GESTURES // 2 + 2
+    speech_over = (round(max(quiet_after) + 3.0, 1)
+                   if quiet_after and enough else cfg["speech_over_floor_db"])
+    if has_stop:
+        print("    %-14s %d of %d rep(s) ended in silence, cut at a %.1f dB gap"
+              % ("Clean stops", len(stop_snaps), STOP_GESTURES, stop_gap))
+
+    ts = [e["t_s"] for e in ev["doubles"]]
+    gaps = [(b - a) * 1000.0 for a, b in zip(ts, ts[1:])
+            if (b - a) * 1000.0 <= PAIR_MAX_MS]
+    if len(gaps) >= 4:
+        g5, g95 = (float(np.percentile(gaps, 5)), float(np.percentile(gaps, 95)))
+        fastest = min(gaps)
+        # Widened, not fitted. Percentiles land the edges on top of the gaps
+        # that were actually performed, and a window whose floor sits 6 ms under
+        # the fastest pair recorded refuses the next one that comes in slightly
+        # quicker. This recording measured seven pairs at 331-366 ms and derived
+        # 325 ms as the floor; five of ten pairs then failed to send. Widening
+        # to 232 ms costs nothing - a stray transient still has to land inside
+        # the window AND be shaped like a snap - and recovers the pairs.
+        double_min = max(40.0, round(g5 * 0.7, 0))
+        double_max = round(g95 * 1.4, 0)
+        # Rounded up to the next 250 ms, and floored at 600. The two mistakes
+        # are not equal: a window too small silently refuses the confirming
+        # snap and the user re-snaps into a session that is already off, while
+        # a window too large only risks pairing a stray snap that has to land
+        # inside one second of a deliberate stop. Ten calibration pairs are a
+        # small sample to set a hard ceiling from.
+        send_window = max(600.0, float(int(g95 / 250.0 + 1) * 250))
+        # Deliberately capped, and capped low. This is the deaf time after a
+        # stop while a confirming snap may still be coming, and its only job is
+        # to not swallow one. Sweeping the refractory from 220 ms down to 30 ms
+        # across a 350-second recording changed the detection count by exactly
+        # one, stable the whole way down - a decaying tail never presents the
+        # rise the onset logic looks for, so it cannot re-fire and there is
+        # nothing here for a long value to buy.
+        #
+        # Deriving it from the fastest gap alone is how the double-snap bug
+        # comes back: one unhurried calibration session sets a value that then
+        # rejects every quick double the user produces afterwards.
+        # pair_refractory_ms is deliberately NOT derived, for the same reason
+        # the shape gates are not: it is detector mechanics, and one take cannot
+        # outvote the measurement it already rests on. Sweeping it from 220 ms
+        # down to 30 ms over a 350-second recording moved the detection count by
+        # exactly one, while double snaps on this machine were measured as fast
+        # as 76 ms - so the value has to sit below 76 whatever a single pass
+        # happens to contain. This recording's fastest pair was 331 ms and the
+        # old rule returned 120, which would have eaten the second snap of every
+        # fast double. The shipped 60 ms is the answer to a better-posed
+        # question than this pass asks.
+        pair_ref = cfg["pair_refractory_ms"]
+    else:
+        print("\n    Only %d usable pair gap(s); keeping the current pairing "
+              "window." % len(gaps))
+        g5 = g95 = fastest = float("nan")
+        double_min, double_max = cfg["double_min_ms"], cfg["double_max_ms"]
+        send_window, pair_ref = cfg["send_window_ms"], cfg["pair_refractory_ms"]
+
+    new = dict(cfg)
+    new.update({"abs_floor_db": abs_floor,
+                "speech_over_floor_db": speech_over,
+                "double_min_ms": double_min, "double_max_ms": double_max,
+                "send_window_ms": send_window,
+                "pair_refractory_ms": pair_ref})
+
+    print("\n" + "=" * 68)
+    print("  Derived")
+    print("=" * 68)
+    for k in ("abs_floor_db", "speech_over_floor_db",
+              "double_min_ms", "double_max_ms", "send_window_ms",
+              "pair_refractory_ms"):
+        flag = "" if new[k] == cfg[k] else "   <- changed"
+        print("    %-22s %-10s (was %s)%s" % (k, new[k], cfg[k], flag))
+
+    # ---- the acceptance gate ----------------------------------------------
+    # Re-measured under the DERIVED config, not the permissive one. The point
+    # is whether the settings about to be written actually work.
+    kept = {k: events_in(audio[k], new, warmup=room)
+            for k in ("snaps_close", "snaps_far", "speech", "noises")}
+    # The double snap is the action the whole tool exists to perform, and until
+    # now nothing checked that the derived config could still perform it. It is
+    # measured end to end through TriggerGate rather than by comparing gaps to
+    # the window, because pairing also depends on refractory and on both snaps
+    # surviving detection - the first version of this window passed every gap
+    # check on paper and sent five times out of ten.
+    sends = trigger_count(audio["doubles"], dict(new, require_double=True), room)
+    idle = trigger_count(room, new)
+    stops = [e for e in kept["speech"]
+             if e.get("speech_after_db") is None
+             or e["speech_after_db"] < new["speech_over_floor_db"]]
+    # The gap the stop pass was cut at IS the margin, and taking it from there
+    # is the whole point of having the pass. Both sides are then one rep of one
+    # gesture recorded against one floor. An earlier version took the quiet side
+    # from pass 7 and the talking side from pass 4 and reported -2.7 dB for the
+    # same audio that pass 7 alone separates by 11.6, because speech_db is dB
+    # above a RUNNING floor and that floor is not the same number in two passes.
+    margin = stop_gap
+
+    # bool() on purpose: numpy comparisons return np.bool_, which json refuses,
+    # and the journal is written after this list is built.
+    checks = [
+        ("at least 9 of 10 close snaps detected",
+         len(kept["snaps_close"]) >= 9, "%d detected" % len(kept["snaps_close"])),
+        ("at least 8 of 10 far snaps detected",
+         len(kept["snaps_far"]) >= 8, "%d detected" % len(kept["snaps_far"])),
+        # The quiet room, not the noisy one. This gate used to require at most
+        # 2 triggers from 30 s of deliberate keyboard, mouse and chair, and no
+        # config can pass it. Sweeping abs_floor_db from -30 to -6 never brought
+        # that pass below 9 without also losing the snaps, because the levels
+        # fully overlap: the noises measured -20 to +3 dB and the far snaps -14
+        # to +18, so a keystroke is louder than half of them. Shape does not
+        # separate them either - a noise-pass transient measured onset_hf 0.99,
+        # tail_hf 0.90, decay 52 ms, better shaped than most genuine snaps. The
+        # shipped config, which works in daily use, scores 16 on the same pass.
+        #
+        # A bar nothing can clear asserts nothing, so this measures what the
+        # tool actually does for most of its life: sit in a quiet room without
+        # firing. The noise count is still computed, printed and journalled, and
+        # README carries the limitation it represents.
+        ("no triggers at all from the quiet room",
+         idle == 0, "%d fired" % idle),
+        ("at least 6 of 10 double snaps actually send",
+         sends >= 6, "%d sent" % sends),
+        ("at most 1 stop survives 60 s of speech",
+         len(stops) <= 1, "%d survived" % len(stops)),
+        # Measured within the stop-gesture pass, never across passes. speech_db
+        # reports dB above a RUNNING floor, and that floor sat at -43 dB in the
+        # snap passes against -5 dB while talking - a 38 dB difference. Comparing
+        # the two, as this check first did, compared numbers with no common
+        # baseline and reported -3.5 dB for audio that is separated by about 34.
+        ("at least 6 dB between post-snap quiet and still-talking",
+         bool(not np.isnan(margin) and margin >= 6.0), "%.1f dB" % margin),
+    ]
+    print("\n" + "=" * 68)
+    print("  Acceptance")
+    print("=" * 68)
+    for name, ok, detail in checks:
+        print("    [%s]  %-46s %s" % ("PASS" if ok else "FAIL", name, detail))
+    if len(kept["noises"]) > 2:
+        print("\n    Note: %d of the deliberate room noises still read as "
+              "snaps. Nothing\n    separates a hard keystroke from a snap on "
+              "this mic, so typing right\n    next to it can occasionally "
+              "fire. See README, Limitations." % len(kept["noises"]))
+
+    journal = {
+        "when": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "device": cfg.get("device"),
+        "room": {"noise_floor_db": round(floor_hf, 1),
+                 "speech_floor_db": round(floor_sp, 1)},
+        "snaps_close": {"n": SNAPS_PER_PASS, "heard": len(ev["snaps_close"]),
+                        "detected": len(kept["snaps_close"]),
+                        "dropped": note_close,
+                        "peak_db": [round(e["peak_db"], 1) for e in close]},
+        "snaps_far": {"n": SNAPS_PER_PASS, "heard": len(ev["snaps_far"]),
+                      "detected": len(kept["snaps_far"]),
+                      "dropped": note_far,
+                      "peak_db": [round(e["peak_db"], 1) for e in far]},
+        "speech": {"seconds": 60, "transients": len(ev["speech"]),
+                   "levels_db": [round(v, 1) for v in speech_after]},
+        "noises": {"seconds": 30, "transients": len(kept["noises"])},
+        "idle_triggers": idle,
+        "doubles_sent": sends,
+        "doubles": {"n": 10, "gaps_ms": [round(g) for g in gaps]},
+        "derived": {k: new[k] for k in
+                    ("abs_floor_db", "speech_over_floor_db",
+                     "double_min_ms", "double_max_ms", "send_window_ms",
+                     "pair_refractory_ms")},
+        "acceptance": {"passed": all(ok for _, ok, _ in checks),
+                       "margin_db": None if np.isnan(margin) else round(margin, 1),
+                       "checks": {name: ok for name, ok, _ in checks}},
+        "recording": str(wav_path.name),
+    }
+    CAL_DIR.mkdir(exist_ok=True)
+    jpath = CAL_DIR / ("%s.json" % stamp)
+
+    def plain(o):
+        """numpy scalars are not JSON, and losing the journal to a TypeError
+        after the user has already performed the six passes is the one failure
+        worth spending five lines to make impossible."""
+        if isinstance(o, np.bool_):
+            return bool(o)
+        if isinstance(o, np.integer):
+            return int(o)
+        if isinstance(o, np.floating):
+            return float(o)
+        return str(o)
+
+    jpath.write_text(json.dumps(journal, indent=2, default=plain),
+                     encoding="utf-8")
+
+    if not all(ok for _, ok, _ in checks):
+        print("\n  %s is unchanged - a config is only written when all %d"
+              % (config_path.name, len(checks)))
+        print("  hold. The recording and the journal are kept, so this run can")
+        print("  be re-derived later without performing it again:")
+        print("      %s" % wav_path)
+        print("      %s" % jpath)
+        if not np.isnan(margin) and margin < 6.0:
+            print("\n  The margin is the one that can be genuinely unsatisfiable.")
+            print("  If your voice and your snap overlap with no gap, no")
+            print("  threshold separates them - move the mic, snap closer, or")
+            print("  accept a manual stop key.")
+        return 1
+
+    good = config_path.with_name("config.known-good.json")
+    if config_path.exists():
+        good.write_text(config_path.read_text(encoding="utf-8"),
+                        encoding="utf-8")
+    # Two successful calibrations in a row used to destroy the hand-tuned
+    # fallback: the first moved it into config.known-good.json, the second
+    # overwrote that with the config the first had just derived. The outgoing
+    # config is therefore also parked next to the journal under the stamp of
+    # the run that replaced it, where nothing later can reach it.
+    (CAL_DIR / ("%s.replaced.json" % stamp)).write_text(
+        json.dumps(cfg, indent=2), encoding="utf-8")
+    config_path.write_text(json.dumps(new, indent=2), encoding="utf-8")
+    print("\n  All %d hold. Wrote %s" % (len(checks), config_path.name))
+    print("  Previous config saved to %s (--restore puts it back)" % good.name)
+    print("  Journal:   %s" % jpath)
+    print("  Recording: %s" % wav_path)
+    print("\n  Next: python snap_to_dictate.py --dry-run")
     return 0
 
 
@@ -1124,11 +1892,18 @@ def resolve_pending(pending, det, cfg, dry_run, events, state, since,
     if dry_run:
         print("[%s] TRIGGER %s  %s after; would stop (dry run)"
               % (stamp, pending["detail"], heard))
-    else:
-        send_key(mod_vks, key_vk)
+    elif send_key_if_focused(mod_vks, key_vk, prof, cfg, "the stop"):
         print("[%s] TRIGGER %s  %s after  -> %s  %s dictation OFF"
               % (stamp, pending["detail"], heard, prof["activate"],
                  prof["name"]))
+    else:
+        # The stop never landed, so the app it belonged to is still recording.
+        # Leave the state alone - when the user comes back to that window their
+        # next snap reads as the stop it was always meant to be. Only the hold
+        # is dropped, and with it anything queued as a send confirmation:
+        # submitting into a window we did not stop is the same mistake one step
+        # further on.
+        return state, since, None
     state, since = SETTLING, time.monotonic()
     start_gate.reset()
 
@@ -1139,10 +1914,10 @@ def resolve_pending(pending, det, cfg, dry_run, events, state, since,
                   % (stamp, pending["detail"]))
         else:
             time.sleep(cfg["send_delay_ms"] / 1000.0)
-            send_key(mod_send, vk_send)
-            print("[%s] TRIGGER %s  -> %s  SENT"
-                  % (time.strftime("%H:%M:%S"), pending["detail"],
-                     prof["send"]))
+            if send_key_if_focused(mod_send, vk_send, prof, cfg, "the submit"):
+                print("[%s] TRIGGER %s  -> %s  SENT"
+                      % (time.strftime("%H:%M:%S"), pending["detail"],
+                         prof["send"]))
             drain(events)
         state, since = IDLE, time.monotonic()
         start_gate.reset()
@@ -1403,11 +2178,13 @@ def listen(cfg, dry_run, instance, watch, record=None):
                                "at": time.monotonic(), "follow": None}
                     print("[%s] hold    %s  checking whether the talking stops"
                           % (stamp, detail))
+                    det.expect_pair()
                     continue
                 send_key(mod_vks, key_vk)
                 print("[%s] TRIGGER %s  -> %s  dictation OFF (snap again "
                       "within %.0f ms to send)"
                       % (stamp, detail, prof["activate"], cfg["send_window_ms"]))
+                det.expect_pair()
             else:
                 # The activate key has already been pressed; the transcript is
                 # still landing. Wait out whatever is left of send_delay_ms
@@ -1415,9 +2192,11 @@ def listen(cfg, dry_run, instance, watch, record=None):
                 rest = cfg["send_delay_ms"] - held_ms
                 if rest > 0:
                     time.sleep(rest / 1000.0)
-                send_key(mod_send, vk_send)
-                print("[%s] TRIGGER %s  -> %s  SENT (confirmed %.0f ms after "
-                      "the stop)" % (stamp, detail, prof["send"], held_ms))
+                if send_key_if_focused(mod_send, vk_send, prof, cfg,
+                                       "the submit"):
+                    print("[%s] TRIGGER %s  -> %s  SENT (confirmed %.0f ms "
+                          "after the stop)"
+                          % (stamp, detail, prof["send"], held_ms))
                 drain(events)
 
             state = {"start": RECORDING, "stop": SETTLING, "send": IDLE}[action]
@@ -1537,6 +2316,192 @@ def cmd_run(cfg, dry_run, config_path, follow=False,
     return 0
 
 
+TERMINALS = frozenset({
+    "windowsterminal.exe", "powershell.exe", "pwsh.exe", "cmd.exe",
+    "conhost.exe", "wezterm-gui.exe", "alacritty.exe", "kitty.exe",
+    "hyper.exe", "mintty.exe",
+})
+
+
+def cmd_verify(cfg, config_path, as_json=False):
+    """Check an installation and say plainly what is wrong with it.
+
+    Setup instructions are prose, and prose cannot tell an installer whether it
+    succeeded. This is the machine-readable other half: an agent handed this
+    repository runs one command and gets a verdict on its own work - whether the
+    dependencies import, whether a microphone actually delivers samples, whether
+    the config it wrote parses and routes, and whether anything is already
+    listening. Exit status is 0 only when nothing FAILed, so it composes into a
+    script without parsing the text.
+
+    Deliberately harmless, because it runs on a machine whose state nobody has
+    checked yet. It presses no keys - a verification step that typed ctrl+d into
+    whatever happened to be in front would be worse than no verification at all
+    - and it holds the input stream for under half a second, releasing it before
+    a running listener would notice.
+
+    Three outcomes, and the difference between them matters. FAIL means the tool
+    cannot work as installed. WARN means it can, but something a person chose is
+    worth seeing. OK means checked and good, and never means assumed.
+    """
+    out = []
+
+    def note(status, label, detail=""):
+        out.append({"status": status, "check": label, "detail": detail})
+
+    # ---- interpreter and dependencies -------------------------------------
+    v = sys.version_info
+    note("OK" if v >= (3, 8) else "FAIL", "python 3.8 or newer",
+         "%d.%d.%d" % (v.major, v.minor, v.micro))
+    note("OK" if sys.platform == "win32" else "FAIL", "running on Windows",
+         "%s - SendInput and the window APIs are Windows-only" % sys.platform)
+    for mod in ("numpy", "sounddevice"):
+        try:
+            m = __import__(mod)
+            note("OK", "%s importable" % mod, getattr(m, "__version__", "?"))
+        except Exception as exc:
+            note("FAIL", "%s importable" % mod, str(exc))
+
+    # ---- the microphone ----------------------------------------------------
+    # Opened for real rather than merely enumerated. A device can be listed and
+    # still refuse to open - claimed in exclusive mode by another application,
+    # or disabled at the driver - so an install that only read the device list
+    # would report success on a machine that cannot hear anything.
+    try:
+        devs = [d for d in sd.query_devices() if d["max_input_channels"] > 0]
+        note("OK" if devs else "FAIL", "an input device exists",
+             "%d found" % len(devs))
+    except Exception as exc:
+        devs = []
+        note("FAIL", "an input device exists", str(exc))
+
+    if devs:
+        blocks = []
+        try:
+            with open_stream(cfg, lambda ind, n, t, st:
+                             blocks.append(float(np.abs(ind).max()))):
+                time.sleep(0.4)
+            note("OK" if blocks else "FAIL", "the stream delivers audio",
+                 "%d blocks in 400 ms" % len(blocks))
+            if blocks:
+                loudest = max(blocks)
+                # Digital silence is the signature of a muted or wrong device
+                # and it is invisible in the device list. A warning rather than
+                # a failure, because a genuinely silent room produces it too.
+                quiet = loudest == 0.0
+                note("WARN" if quiet else "OK",
+                     "the samples are not digital silence",
+                     "peak %.5f%s"
+                     % (loudest, "  <- muted, or the wrong device" if quiet
+                        else ""))
+        except Exception as exc:
+            note("FAIL", "the stream delivers audio", str(exc))
+
+    # ---- the config --------------------------------------------------------
+    note("OK" if config_path.exists() else "WARN", "config file present",
+         str(config_path) if config_path.exists()
+         else "not written yet, so the built-in defaults are in use")
+
+    # Unknown keys are how a typo hides. load_config merges over DEFAULTS, so a
+    # misspelled key is accepted in silence while the setting it was meant to
+    # change keeps its old value, and nothing else in the tool ever mentions it.
+    unknown = sorted(k for k in cfg if k not in DEFAULTS)
+    note("OK" if not unknown else "FAIL", "no unrecognised config keys",
+         "none" if not unknown else ", ".join(unknown))
+
+    profiles = cfg.get("profiles") or []
+    note("OK" if profiles else "WARN", "at least one app profile",
+         "%d wired" % len(profiles) if profiles
+         else "none, so the legacy single-app path will be used")
+
+    # Only profiles that are switched on have to be complete. A disabled entry
+    # with no activate key is a deliberate placeholder - the app is wired up and
+    # waiting for somebody to find its dictation shortcut - and profile_ready()
+    # already refuses to send for one. The first run of this check called two
+    # such placeholders a failure, which would have sent an installing agent off
+    # to fix a config that was correct.
+    bad, waiting = [], []
+    for prof in profiles:
+        name = prof.get("name")
+        if not name:
+            bad.append("a profile has no name")
+            continue
+        if not prof.get("process") and not prof.get("title"):
+            bad.append("%s matches on neither process nor title" % name)
+        if not prof.get("enabled"):
+            if not prof.get("activate"):
+                waiting.append(name)
+            continue
+        if not prof.get("activate"):
+            bad.append("%s is enabled but has no activate key" % name)
+        for field in ("activate", "send"):
+            if not prof.get(field):
+                continue
+            try:
+                parse_key(prof[field])
+            except Exception as exc:
+                bad.append("%s: %s %s" % (name, field, exc))
+    live_profiles = [p for p in profiles if p.get("enabled")]
+    note("OK" if not bad else "FAIL", "every enabled profile is complete",
+         "all %d" % len(live_profiles) if not bad else "; ".join(bad))
+    if waiting:
+        note("WARN", "profiles waiting to be configured",
+             "%s - disabled, no activate key set yet" % ", ".join(waiting))
+
+    # ---- the safety property ----------------------------------------------
+    # ctrl+d is dictation in the Claude desktop app and end-of-input in every
+    # shell, so a stop that lands in a terminal closes it - and when that
+    # terminal is running an agent, the agent dies mid-task. No profile may ever
+    # match one. The test suite asserts this as well; it is repeated here
+    # because somebody editing config.json by hand never runs the test suite.
+    caught = sorted(t for t in TERMINALS if resolve_profile(t, "", cfg))
+    note("OK" if not caught else "FAIL", "no profile matches a terminal",
+         "none of the %d checked" % len(TERMINALS) if not caught
+         else "MATCHES " + ", ".join(caught))
+
+    # ---- what is running ---------------------------------------------------
+    # claim_instance only asks whether the named event already exists; it never
+    # signals it, so this cannot stop a listener it finds. The handle is closed
+    # straight away in the other case, or this check would itself become the
+    # running instance and block the real one from starting.
+    handle = claim_instance()
+    if handle is None:
+        note("OK", "listener status", "one is already running")
+    else:
+        kernel32.CloseHandle(handle)
+        note("WARN", "listener status",
+             "not running - start it with: python autostart.py")
+
+    wanted = {p["process"].lower() for p in profiles if p.get("process")}
+    live = sorted(wanted & running_exes())
+    note("OK" if live else "WARN", "a wired app is running",
+         ", ".join(live) if live else "none of the wired apps is open")
+
+    if as_json:
+        print(json.dumps({"checks": out,
+                          "failed": [c["check"] for c in out
+                                     if c["status"] == "FAIL"]}, indent=2))
+        return 1 if any(c["status"] == "FAIL" for c in out) else 0
+
+    print("=" * 68)
+    print("  Verifying this installation")
+    print("=" * 68)
+    for c in out:
+        print("  [%-4s] %-34s %s" % (c["status"], c["check"], c["detail"]))
+    failed = sum(1 for c in out if c["status"] == "FAIL")
+    warned = sum(1 for c in out if c["status"] == "WARN")
+    print("")
+    if failed:
+        print("  %d check(s) failed. The tool will not work until they are "
+              "fixed." % failed)
+    elif warned:
+        print("  Everything required is in place. %d thing(s) above are worth "
+              "a look." % warned)
+    else:
+        print("  Everything checked out.")
+    return 1 if failed else 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--config", type=Path, default=CONFIG_PATH)
@@ -1546,7 +2511,10 @@ def main():
     ap.add_argument("--single", action="store_true", help="require a single snap")
     ap.add_argument("--list-devices", action="store_true")
     ap.add_argument("--whoami", action="store_true", help="print the focused process")
-    ap.add_argument("--calibrate", action="store_true")
+    ap.add_argument("--calibrate", action="store_true",
+                    help="record the seven calibration passes, then derive a config")
+    ap.add_argument("--derive", type=Path, metavar="PATH.wav",
+                    help="re-derive from a past calibration recording")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--replay", type=Path, metavar="PATH.wav",
                     help="run a recorded session back through the detector")
@@ -1566,6 +2534,10 @@ def main():
                     help="snapshot the current config as the known-good fallback")
     ap.add_argument("--restore", action="store_true",
                     help="put the known-good fallback back into config.json")
+    ap.add_argument("--verify", action="store_true",
+                    help="check this installation and exit non-zero if broken")
+    ap.add_argument("--json", action="store_true",
+                    help="machine-readable output, currently for --verify only")
     ap.add_argument("--test-key", action="store_true",
                     help="send the keystroke on a countdown, no mic involved")
     args = ap.parse_args()
@@ -1604,12 +2576,16 @@ def main():
     if args.single:
         cfg["require_double"] = False
 
+    if args.verify:
+        return cmd_verify(cfg, args.config, as_json=args.json)
     if args.whoami:
         return cmd_whoami(cfg)
     if args.test_key:
         return cmd_test_key(cfg, override=args.key)
     if args.calibrate:
         return cmd_calibrate(cfg, args.config)
+    if args.derive is not None:
+        return cmd_derive(cfg, args.derive, args.config)
     if args.replay:
         return cmd_replay(cfg, args.replay)
     return cmd_run(cfg, args.dry_run, args.config, record_path=args.record,

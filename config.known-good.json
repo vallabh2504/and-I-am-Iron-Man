@@ -29,5 +29,74 @@
   "recording_max_s": 180.0,
   "strict_tail_hf_ratio_min": 0.7,
   "min_recording_ms": 700.0,
-  "send_window_ms": 1000.0
+  "send_window_ms": 1000.0,
+  "confirm_stop_with_silence": true,
+  "speech_band_hz": [
+    100,
+    900
+  ],
+  "speech_window_ms": [
+    150,
+    300
+  ],
+  "speech_over_floor_db": 14.0,
+  "speech_floor_fall": 0.25,
+  "speech_floor_rise": 0.0001,
+  "profiles": [
+    {
+      "name": "Claude desktop",
+      "process": "claude.exe",
+      "title": null,
+      "mode": "dictation",
+      "activate": "ctrl+d",
+      "send": "enter",
+      "enabled": true
+    },
+    {
+      "name": "Codex",
+      "process": "chatgpt.exe",
+      "title": "^Codex$",
+      "mode": "oneshot",
+      "activate": "ctrl+b",
+      "send": null,
+      "enabled": true
+    },
+    {
+      "name": "ChatGPT",
+      "process": "chatgpt.exe",
+      "title": "^ChatGPT$",
+      "mode": "oneshot",
+      "activate": "ctrl+b",
+      "send": null,
+      "enabled": true
+    },
+    {
+      "name": "Antigravity",
+      "process": "antigravity.exe",
+      "title": null,
+      "mode": "dictation",
+      "activate": "ctrl+m",
+      "send": "enter",
+      "enabled": true
+    },
+    {
+      "name": "Antigravity IDE",
+      "process": "antigravity ide.exe",
+      "title": null,
+      "mode": "oneshot",
+      "activate": null,
+      "send": null,
+      "enabled": false
+    },
+    {
+      "name": "VS Code",
+      "process": "code.exe",
+      "title": null,
+      "mode": "oneshot",
+      "activate": null,
+      "send": null,
+      "enabled": false
+    }
+  ],
+  "pair_refractory_ms": 60.0
 }

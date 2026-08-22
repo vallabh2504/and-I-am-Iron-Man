@@ -7,6 +7,7 @@ Two halves:
      to check the shipped config.json against ground truth.
 """
 import inspect
+import re
 import sys
 from pathlib import Path
 
@@ -218,8 +219,7 @@ for spec, want in [("ctrl+d", ([0x11], ord("D"))),
 
 print(NL_ + "target safety")
 live = load_config(CONFIG_PATH)
-TERMINALS = {"windowsterminal.exe", "powershell.exe", "pwsh.exe", "cmd.exe",
-             "conhost.exe", "wezterm-gui.exe", "alacritty.exe"}
+from snap_to_dictate import TERMINALS
 targets = set(t.lower() for t in live["target_processes"])
 check("key is the app's dictation toggle", live["key"], "ctrl+d")
 check("no terminal can receive it", sorted(TERMINALS & targets), [])
@@ -408,6 +408,45 @@ check("the survivor is indistinguishable from a snap",
 print("    it reads %.1f dB, inside the %.1f-%.1f dB spread of real snaps"
       % (min(SESSION_SPEECH), min(SESSION_SNAPS), max(SESSION_SNAPS)))
 
+# --------------------------------------------- the send confirmation window
+
+# The refractory has two jobs that only look like one, and after a stop they
+# pull opposite ways. Covering a snap's own decaying tail needs roughly the
+# decay time; stopping three gestures in a second needs far longer. 220 ms is
+# set for the second job, and while a send may follow it is actively wrong:
+# the confirming snap arrives as fast as fingers move, so the detector was deaf
+# for the whole of it and the second snap of a double was never heard at all.
+_pair = SnapDetector(load_config(CONFIG_PATH))
+
+check("the pair refractory is shorter than the full one",
+      _pair.pair_refractory_blocks < _pair.refractory_blocks, True)
+
+_pair._rearm(True)
+_full_cooldown = _pair.cooldown
+_pair.expect_pair()
+check("expecting a pair cuts the deaf time short",
+      (_full_cooldown, _pair.cooldown),
+      (_pair.refractory_blocks, _pair.pair_refractory_blocks))
+
+# min(), not assignment. A transient that was merely rejected already has a
+# much shorter cooldown, and lengthening it here would swallow the genuine snap
+# that follows a cough - which is the case reject_refractory_ms exists for.
+_pair._rearm(False)
+_rejected = _pair.cooldown
+_pair.expect_pair()
+check("...but never lengthens one", _pair.cooldown, _rejected)
+
+# How short it can safely be was measured, not guessed. Sweeping the refractory
+# from 220 ms to 30 ms over a 350-second recording moved the detection count by
+# exactly one, stable the whole way down - a decaying tail never presents the
+# rise the onset logic looks for, so it cannot re-fire. The binding constraint
+# is therefore the other end: double snaps measured on this machine run
+# 76-989 ms, and anything at or above 76 ms would still eat the fastest of them.
+_pair_ms = _pair.pair_refractory_blocks * _pair.block_ms
+check("it admits the fastest double snap measured here", _pair_ms < 76.0, True)
+check("...without going to nothing at all", _pair_ms >= 30.0, True)
+
+
 # ------------------------------------------------------- per-app routing
 # One snap has to mean different things depending on which window is in front.
 # The cases below are not hypothetical: every (process, title) pair here was
@@ -523,6 +562,197 @@ check("...as a dictation profile",
 
 check("case in the image name does not matter",
       (route("CLAUDE.EXE", "Claude") or {}).get("name"), "Claude desktop")
+
+
+# ------------------------------------------ focus checked at the moment of send
+# Three sends do not happen in the same breath as the focus check that
+# authorised them: a held stop waits on the silence check, and a submit waits
+# for the transcript to land. Focus can move during either wait. These assert
+# that the window is re-read at the instant of the press, because a stop that
+# arrives late in a terminal sends ctrl+d to a shell and closes it.
+
+import snap_to_dictate as _s
+
+_sent = []
+
+
+def _with_focus(exe, title, prof_name, what="the stop"):
+    """Run send_key_if_focused against a pretended foreground window."""
+    real_fg, real_send = _s.foreground_window, _s.send_key
+    _s.foreground_window = lambda: (exe, title)
+    _s.send_key = lambda m, k: _sent.append((m, k))
+    prof = next(p for p in ROUTING["profiles"] if p["name"] == prof_name)
+    try:
+        before = len(_sent)
+        ok = _s.send_key_if_focused((), 0x20, prof, ROUTING, what)
+        return ok, len(_sent) - before
+    finally:
+        _s.foreground_window, _s.send_key = real_fg, real_send
+
+
+check("a stop lands when focus never moved",
+      _with_focus("claude.exe", "Claude", "Claude desktop"), (True, 1))
+
+# The headline failure. ctrl+d is dictation in the Claude desktop app and
+# end-of-input in every shell, so this exact case is what the routing table,
+# the anchored titles, and this guard all exist to prevent.
+check("a stop is dropped, not sent, into a terminal",
+      _with_focus("windowsterminal.exe", "Windows PowerShell", "Claude desktop"),
+      (False, 0))
+check("...and into an editor that is not wired",
+      _with_focus("code.exe", "CODEX", "Claude desktop"), (False, 0))
+
+# Same executable, same PID, different window. Matching on the process would
+# pass this and submit into the wrong ChatGPT window; matching on the profile
+# name catches it.
+check("a submit is dropped when focus moved within one process",
+      _with_focus("chatgpt.exe", "Codex", "ChatGPT", "the submit"), (False, 0))
+check("...and honoured when it is the same window",
+      _with_focus("chatgpt.exe", "ChatGPT", "ChatGPT", "the submit"), (True, 1))
+
+check("a stop is dropped when focus moved to another wired app",
+      _with_focus("antigravity.exe", "Antigravity", "Claude desktop"),
+      (False, 0))
+
+# The guard is only worth having if every delayed send actually calls it. A
+# direct send_key on any of these paths is the bug coming back.
+_src = inspect.getsource(_s)
+_deferred = _src[_src.index("def resolve_pending"):]
+_deferred = _deferred[:_deferred.index("def listen")]
+check("no delayed send in resolve_pending bypasses the guard",
+      "send_key(" in _deferred.replace("send_key_if_focused(", ""), False)
+check("the guard is reached from all three delayed sends",
+      _src.count("send_key_if_focused("), 4)   # 1 definition + 3 call sites
+
+
+# ------------------------------------------- calibration matches its document
+# CALIBRATION.md once described a six-pass protocol with an acceptance gate and
+# a journal, while the code ran three seconds of quiet and five snaps. An agent
+# handed this repo read the document, followed it, and the commands were not
+# there. These assert the two cannot drift apart again silently.
+
+from snap_to_dictate import (CAL_PASSES, SNAPS_PER_PASS, STOP_GESTURES,
+                             STOP_QUIET_DB, permissive, snap_set,
+                             stop_snaps_from)
+
+_DOC = (Path(__file__).resolve().parent / "CALIBRATION.md").read_text(
+    encoding="utf-8")
+README_ = (Path(__file__).resolve().parent / "README.md").read_text(
+    encoding="utf-8")
+
+check("the document describes as many passes as the code runs",
+      _DOC.count(NL_ + "### Pass "), len(CAL_PASSES))
+for _i, _p in enumerate(CAL_PASSES, 1):
+    check("...pass %d is %s in both" % (_i, _p["title"]),
+          ("### Pass %d — %s" % (_i, _p["title"])) in _DOC, True)
+
+# The gate is the part a user relies on to not be handed a broken config, so
+# each criterion has to survive in both places or in neither.
+check("the gate measures the quiet room, not the noisy one",
+      "No triggers at all from the quiet room" in _DOC, True)
+check("...and the code agrees",
+      inspect.getsource(_s.derive).count("no triggers at all from the quiet"), 1)
+check("the primary action is what the gate checks",
+      inspect.getsource(_s.derive).count("double snaps actually send"), 1)
+check("the margin is measured within the stop gesture, not across passes",
+      "never from two different" in _DOC, True)
+check("...and the code takes it from the gap the pass was cut at",
+      "margin = stop_gap" in inspect.getsource(_s.derive), True)
+check("the doc says which settings are left alone",
+      "What calibration does not derive" in _DOC, True)
+
+# --verify runs on a machine nobody has inspected yet, so what it must NOT do
+# matters as much as what it checks. These are read off the source because the
+# alternative - actually running it - needs a microphone.
+_verify = inspect.getsource(_s.cmd_verify)
+check("--verify presses no keys", "send_key(" in _verify, False)
+check("--verify never signals the stop event", "SetEvent" in _verify, False)
+check("...and releases the singleton it tests for",
+      "CloseHandle" in _verify, True)
+check("--verify exits non-zero when something failed",
+      "return 1 if failed else 0" in _verify, True)
+check("the terminal list covers the common shells",
+      {"cmd.exe", "powershell.exe", "pwsh.exe",
+       "windowsterminal.exe"} <= set(TERMINALS), True)
+AGENTS_ = (Path(__file__).resolve().parent / "AGENTS.md").read_text(
+    encoding="utf-8")
+check("the agent guide exists and names the verify command",
+      "--verify" in AGENTS_, True)
+
+# AGENTS.md points at source lines, and line numbers rot the moment anything is
+# inserted above them. Every citation names a symbol on the same line, so the
+# citation can be checked against what is actually there.
+_SRC_LINES = (Path(__file__).resolve().parent
+              / "snap_to_dictate.py").read_text(encoding="utf-8").split(NL_)
+_stale = []
+for _line in AGENTS_.split(NL_):
+    for _n in re.findall(r"snap_to_dictate\.py:(\d+)", _line):
+        _at = _SRC_LINES[int(_n) - 1]
+        _names = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]{3,}", _line))
+        if not any(nm in _at for nm in _names):
+            _stale.append("%s -> %r" % (_n, _at.strip()[:40]))
+check("every source line AGENTS.md cites still holds what it says",
+      _stale, [])
+
+# CALIBRATION.md once told a reader to run --diagnose, which has never existed.
+# A command named in a document is a promise, so every flag either parses or
+# this fails. --restore is the odd one: it is real, and named in prose only.
+_FLAGS = set(re.findall(r"`(--[a-z][a-z-]+)", _DOC + README_))
+_KNOWN = set(re.findall(r'"(--[a-z][a-z-]+)"', _src))
+check("every flag the documents name actually exists",
+      sorted(_FLAGS - _KNOWN), [])
+
+# The gates calibration opens are the level gates. Opening the shape gates too
+# turns the detector into a transient counter - it found 31 events in a pass
+# containing 10 snaps, and every derived threshold collapsed.
+_loose = permissive(load_config(CONFIG_PATH))
+check("calibration opens the level gates all the way",
+      _loose["abs_floor_db"] <= -70.0, True)
+check("...but keeps the shape gates meaningful",
+      _loose["tail_hf_ratio_min"] >= 0.5, True)
+
+# A snap is bright at the tail and performed alone; the things mistaken for one
+# are dull, or arrive in bursts. Neither test is the count - a pass that asks
+# for ten and gets twelve real snaps must keep all twelve.
+def _ev(t_s, tail):
+    return {"t_s": t_s, "onset_block": int(t_s * 172), "tail_hf": tail,
+            "peak_db": 0.0}
+
+
+_kept, _note = snap_set([_ev(0.5, 0.94), _ev(2.4, 0.08), _ev(4.3, 0.90),
+                         _ev(6.2, 0.16), _ev(8.1, 0.96)], 3)
+check("dull transients are dropped whatever the count says",
+      [e["t_s"] for e in _kept], [0.5, 4.3, 8.1])
+check("...and the reason is reported", _note, "2 too dull")
+
+# Twelve snaps on a two-second cadence is what the real recording held, and
+# ranking down to ten discarded two of them, then called the discards junk.
+_twelve = [_ev(0.7 + 1.95 * i, 0.65 + 0.02 * i) for i in range(12)]
+check("snapping past the asked-for count keeps every snap",
+      len(snap_set(_twelve, 10)[0]), 12)
+
+# A snap heard twice off a wall should cost the reflection, not the snap.
+_echo, _note2 = snap_set([_ev(1.0, 0.93), _ev(1.12, 0.66), _ev(3.0, 0.88)], 2)
+check("a reflection loses to the snap that caused it",
+      [e["tail_hf"] for e in _echo], [0.93, 0.88])
+check("...and that reason is reported too",
+      _note2, "1 too close to a neighbour")
+
+# The stop pass labels itself: the snap is the transient with quiet after it.
+def _st(after):
+    return {"speech_after_db": after}
+
+
+_quiet, _gap = stop_snaps_from([_st(v) for v in
+                                (1.7, 25.4, 3.9, 26.1, 5.0, 29.8, 7.3, 18.9)])
+check("the stop pass is cut at its widest gap",
+      [e["speech_after_db"] for e in _quiet], [1.7, 3.9, 5.0, 7.3])
+check("...and the gap is the margin the gate checks", round(_gap, 1), 11.6)
+check("every rep going quiet is a clean pass, not a missing gap",
+      stop_snaps_from([_st(v) for v in (1.0, 2.0, 9.0, 3.0)])[0].__len__(), 4)
+check("...and the quiet ceiling is what decides that", STOP_QUIET_DB, 12.0)
+check("the stop-gesture count is what the document asks for",
+      (SNAPS_PER_PASS, STOP_GESTURES), (10, 8))
 
 
 # ------------------------------------------------------------- lifecycle

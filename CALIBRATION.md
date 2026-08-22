@@ -2,9 +2,13 @@
 
 How a new user teaches Snap-To-Dictate their snap, their voice, and their room.
 
-Takes about six minutes of the user's time. Produces a `config.json`, a
+Takes about five minutes of the user's time. Produces a `config.json`, a
 `config.known-good.json` to fall back to, a recording, and a dated journal
 entry so a later calibration can be compared against this one.
+
+Run it with `python snap_to_dictate.py --calibrate`. To re-derive from a
+recording made earlier, without performing it again, use
+`python snap_to_dictate.py --derive calibration/<stamp>.wav`.
 
 ---
 
@@ -44,7 +48,7 @@ Confirm three things, and stop if any of them is wrong.
 | Check | How | If it fails |
 |---|---|---|
 | The right microphone is selected | `python snap_to_dictate.py --list-devices` | Pick the index and set `device` in `config.json` |
-| The target app is running | Task Manager, or `--diagnose` | Start it |
+| The target app is running | Task Manager, or `--whoami` with the app in front | Start it |
 | The activation key is correct for that app | `python snap_to_dictate.py --test-key` | Find the real shortcut before calibrating |
 
 The key check matters more than it looks. `ctrl+d` is dictation in the Claude
@@ -54,7 +58,7 @@ key is safe.
 
 ---
 
-## The six passes
+## The seven passes
 
 Run them in order. Each pass depends on the one before it: the room floor is
 needed to interpret the snaps, the snaps are needed to interpret the voice, and
@@ -128,9 +132,15 @@ the desk. Open and close a drawer. If a door or a fan is part of your room,
 include it.
 
 - **Measures:** transients from non-vocal sources.
-- **Fails if:** anything here survives the final derived settings. Unlike
-  speech, these have no excuse — a keyboard is not a snap on any feature, and
-  one getting through means a gate is far too loose.
+- **Fails if:** more than two survive the final derived settings.
+
+  This used to demand zero, on the reasoning that a keyboard is not a snap on
+  any feature. That reasoning was wrong, and the first real recording disproved
+  it: a transient in this pass measured onset_hf **0.99**, tail_hf **0.90**,
+  decay **52 ms** — brighter and better shaped than most of the genuine snaps
+  in the same session. A mouse click and a finger snap are the same event to
+  this detector and no threshold separates them. What the pass still catches is
+  a gate that is far too loose; the first derived config let **26** through.
 
 ### Pass 6 — Double snaps · 10 pairs · your natural rhythm
 
@@ -140,11 +150,34 @@ under no pressure.
 
 - **Measures:** the gap between the two snaps in each pair.
 - **Records:** the gap distribution — this sets the pairing window and the
-  refractory period.
+  paired refractory.
 - **Fails if:** the gaps span more than about 600 ms end to end. A window wide
   enough to catch all of them is wide enough for two unrelated speech
   transients to pair up by accident, and the user should be told that rather
   than given a window that misfires.
+
+### Pass 7 — Stop gesture · 8 repetitions · talk, snap, stop
+
+Talk for a few seconds, snap once, and stop talking immediately. Repeat eight
+times. This is the only pass that performs the gesture the tool actually has to
+judge, and it exists because of a measurement the first six passes could not
+make honestly.
+
+`speech_db` reports a level in dB *above a running floor*, and that floor
+follows the room. On the first real recording it sat at **-43 dB** through the
+snap passes and **-5.4 dB** while talking — a 38 dB difference. Numbers taken
+from those two passes therefore have no common baseline, and comparing them
+reported a **-3.5 dB** margin for audio actually separated by about 34 dB.
+
+Here both sides come from the same condition: the speaker has been talking, so
+the floor is where it will be in real use, and the level after the snap is
+measured against it.
+
+- **Measures:** the speech-band level after each stop snap, against the
+  talking floor.
+- **Records:** that distribution — this is what sets `speech_over_floor_db`.
+- **Fails if:** fewer than 6 of the 8 register, or the pass is missing. A
+  recording without it cannot answer requirement 5 and no config is written.
 
 ---
 
@@ -156,15 +189,44 @@ against the recording that produced it.
 | Setting | Rule |
 |---|---|
 | `abs_floor_db` | weakest snap across passes 2 and 3, minus 4 dB — but never below the room floor plus 12 dB |
-| `hf_ratio_min` | 5th percentile of snap onset high-band ratio, minus 0.03 |
-| `tail_hf_ratio_min` | 5th percentile of snap tail high-band ratio, minus 0.03 |
-| `min_decay_ms` / `max_decay_ms` | the snap decay range, widened 25% on each side |
-| `speech_over_floor_db` | highest post-snap quiet level, plus 3 dB |
-| `double_min_ms` / `double_max_ms` | 5th and 95th percentile of the pass 6 gaps |
+| `speech_over_floor_db` | highest post-snap quiet level **in pass 7**, plus 3 dB — only if at least 6 of the 8 reps ended in silence |
+| `double_min_ms` / `double_max_ms` | 5th percentile of the pass 6 gaps × 0.7, and the 95th × 1.4 |
 | `send_window_ms` | 95th percentile double-snap gap, rounded up to the next 250 ms |
-| `refractory_ms` | just under the fastest gap seen in pass 6 |
 
-Two of these deserve their asymmetry spelled out.
+### What calibration does not derive
+
+`hf_ratio_min`, `tail_hf_ratio_min`, `min_decay_ms`, `max_decay_ms` and
+`pair_refractory_ms` are **left at their shipped values**, and that is a
+deliberate reversal of an earlier version that derived all five.
+
+The first four describe the *shape* of a snap — it arrives instantly, stays
+bright as it fades, and is over inside a fifth of a second. That is physics, and
+it is the same in every room. Only levels and timings change with a room, a
+microphone and a person, and those are what the passes measure.
+
+Deriving them was tried and was worse on two counts. It is circular: the snap
+set is picked using the very features being fitted to it, so the gate can only
+ever loosen. And the measurement is unsound — `onset_hf` is read at the onset
+block, which sits *before* the transient whenever the attack is slow, so it
+reports the room rather than the snap. Every far snap has a slow measured attack,
+because at that distance the level climbs through reflections instead of
+arriving at once; one real far snap read `onset_hf` 0.16 alongside a `tail_hf`
+of 0.98. Fitting to that pulled `hf_ratio_min` from 0.45 down to 0.162.
+
+`pair_refractory_ms` is detector mechanics, and one 34-second pass cannot
+outvote the measurement it already rests on. Sweeping it from 220 ms down to
+30 ms across a 350-second recording moved the detection count by exactly one,
+while double snaps on this machine were measured as fast as **76 ms** — so the
+value has to sit below 76 whatever a single pass happens to contain. One
+recording's fastest pair was 331 ms, and the old rule returned 120 ms, which
+would have swallowed the second snap of every fast double.
+
+The shipped values are tuned against a labelled field log with confirmed ground
+truth, which is evidence a 24-second unlabelled pass cannot offer. If they do
+not fit a given room, requirements 1 and 2 fail and nothing is written — the
+honest inverse of loosening a gate until it fits.
+
+Two of the derived rules deserve their asymmetry spelled out.
 
 **`abs_floor_db` is set from the weakest snap, not the average.** The two
 mistakes are not equal in cost. A gate set too low lets in an occasional room
@@ -182,22 +244,56 @@ at the price of an occasional repeat, which is the right trade.
 
 ## The acceptance gate
 
-Calibration writes a config only if all five hold. If any fails, it reports
+Calibration writes a config only if all six hold. If any fails, it reports
 which one and why, and leaves the previous config alone.
 
 | # | Requirement | Source |
 |---|---|---|
 | 1 | At least 9 of 10 close snaps detected | Pass 2 |
 | 2 | At least 8 of 10 far snaps detected | Pass 3 |
-| 3 | Zero triggers from room noise | Pass 5 |
-| 4 | At most 1 stop survives 60 s of speech | Pass 4 |
-| 5 | At least 6 dB between the loudest post-snap quiet and the quietest speech transient | Passes 2–4 |
+| 3 | No triggers at all from the quiet room | Pass 1 |
+| 4 | At least 6 of 10 double snaps actually send | Pass 6 |
+| 5 | At most 1 stop survives 60 s of speech | Pass 4 |
+| 6 | At least 6 dB between post-snap quiet and still-talking | Pass 7 |
 
-Requirement 5 is the one that can genuinely be unsatisfiable. If a user's voice
+Requirement 3 used to read *at most 2 triggers from 30 s of room noise*, and no
+config can pass it. Sweeping `abs_floor_db` from -30 to -6 never brought that
+pass below 9 without also losing the snaps, because the levels fully overlap:
+the deliberate noises measured -20 to +3 dB and the far snaps -14 to +18, so a
+hard keystroke is louder than half of them. Shape does not separate them either
+— one noise-pass transient measured `onset_hf` 0.99, `tail_hf` 0.90, decay 52 ms,
+better shaped than most genuine snaps. The shipped config, which works in daily
+use, scores 16 on the same pass. A bar nothing can clear asserts nothing, so the
+requirement now measures what the tool does for most of its life: sit in a quiet
+room without firing. The noise count is still printed and journalled, and README
+carries the limitation it represents.
+
+Requirement 4 exists because the double snap is the action the whole tool is
+for, and nothing checked it. It is measured end to end through the trigger gate
+rather than by comparing gaps to the window, because pairing also depends on the
+refractory and on both snaps surviving detection. The first version of the
+pairing window passed every gap check on paper and sent five times out of ten.
+
+Requirement 6 is the one that can genuinely be unsatisfiable. If a user's voice
 and a user's snap overlap with no margin, no threshold separates them, and the
 honest output is to say so and offer the alternatives — move the microphone,
 snap closer, or accept a manual stop key — rather than to pick a number and let
 them discover the problem mid-sentence.
+
+Both sides of it must come from **pass 7 alone**, never from two different
+passes. See pass 7 for why: `speech_db` reports dB above a *running* floor, and
+that floor sat at -43 dB in the snap passes against -5 dB while talking. An
+earlier version took the quiet side from pass 7 and the talking side from pass 4
+and reported -2.7 dB for audio that pass 7 by itself separates by 11.6.
+
+The split within pass 7 is not chosen by a threshold. The pass instructs *talk,
+snap once, stop talking*, so the snap is the transient with quiet on the far side
+of it — a label the user performed. Sorting the pass by post-transient level
+lands it in two obvious groups, and the widest step between them is both the cut
+and the margin. On the first recording to carry the pass that read 1.7 / 3.9 /
+5.0 / 7.3 dB against 18.9 and up: four clean gestures, ten mid-sentence
+transients, an 11.6 dB canyon between them. If every rep ends in silence there is
+no canyon and none is invented — the whole pass counts as clean.
 
 ---
 

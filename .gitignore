@@ -13,3 +13,15 @@
 *.bak-*
 __pycache__/
 *.pyc
+
+# Calibration output. The journals record one person's room, microphone and
+# voice levels, and the recording they were derived from is a *.wav that this
+# file already excludes - so a journal on its own cannot be re-derived or
+# checked by anyone else. Kept on disk, where --derive can still reach them.
+calibration/*.json
+
+# Config snapshots and hand-tuning leftovers from the sessions that produced
+# the shipped defaults. Real provenance, but local: nothing in the code or the
+# documentation reads them.
+snapshots/
+orig-working.json

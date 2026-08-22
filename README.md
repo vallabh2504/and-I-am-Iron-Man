@@ -173,7 +173,7 @@ replaying the logs:
 |---|---|---|
 | `strict_min_decay_ms` 30 | Decay is counted in whole 5.8 ms blocks, so it lands only on multiples of 5.8. 30 ms sat between the 5-block (29.0) and 6-block (34.8) steps. | removed |
 | `strict_max_decay_ms` 120 | Cut off the long-tail end of real far-field snaps (measured up to 157 ms). | removed |
-| `refractory_ms` 220 | Floors to 37 blocks = **214.8 ms** of hard deafness, which silently made the advertised `double_min_ms` of 120 ms unreachable — the bottom 45% of the pairing window did not exist. | 160 |
+| `refractory_ms` 220 | Floors to 37 blocks = **214.8 ms** of hard deafness, which silently made the advertised `double_min_ms` of 120 ms unreachable — the bottom 45% of the pairing window did not exist. | still 220, but see below |
 
 Between them the strict decay bounds refused **21 real snaps** across two
 logged sessions and never once caught a non-snap. Those 21 are now part of
@@ -433,16 +433,26 @@ Or `run.bat`, which launches it minimised.
 
 ## Autostart at logon
 
-A scheduled task starts the listener when you log in:
+A scheduled task starts the listener when you log in. Run this from inside the
+repository directory — it reads both paths from the environment rather than
+hardcoding them, so it works on any machine without editing:
 
 ```powershell
-$pw  = "C:\Users\valla\AppData\Local\Microsoft\WindowsApps\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\pythonw.exe"
-$act = New-ScheduledTaskAction -Execute $pw -Argument '"D:\CLAUDE\Snap-To-Dictate\autostart.py"' -WorkingDirectory "D:\CLAUDE\Snap-To-Dictate"
+$dir = (Get-Location).Path
+$py  = (Get-Command python).Source
+$pw  = Join-Path (Split-Path $py) "pythonw.exe"
+if (-not (Test-Path $pw)) { $pw = $py }
+
+$act = New-ScheduledTaskAction -Execute $pw -Argument "`"$dir\autostart.py`"" -WorkingDirectory $dir
 $trg = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $trg.Delay = "PT20S"
 $prn = New-ScheduledTaskPrincipal -UserId "$env:COMPUTERNAME\$env:USERNAME" -LogonType Interactive -RunLevel Limited
 Register-ScheduledTask -TaskName SnapToDictate -Action $act -Trigger $trg -Principal $prn -Force
 ```
+
+`pythonw.exe` is the console-less interpreter, which is why the task opens no
+window. A few installs ship without it; the fallback above uses `python.exe`
+instead, and the only cost is a console window at logon.
 
 Two properties of that principal are load-bearing, and both fail silently-ish
 if you get them wrong:
@@ -518,9 +528,18 @@ python snap_to_dictate.py --stop
 - **A snap while another window has focus does nothing.** It is still written to
   `snap.log`, marked `skipped`, along with the process that had focus. That log
   line is the first thing to read when a snap "did not work".
-- **A rejected transient costs 12 ms of deafness, not 160.** `refractory_ms`
+- **A rejected transient costs 12 ms of deafness, not 220.** `refractory_ms`
   applies only after an accepted snap; `reject_refractory_ms` covers rejections,
   so a snap that lands right after a cough or a keystroke is not swallowed.
+- **A stop cuts the deafness to `pair_refractory_ms` (60 ms).** The same 214.8 ms
+  that once made the bottom of the pairing window unreachable came back in a new
+  place: it sat across the send confirmation, so the second snap of a double was
+  not rejected, it was never heard — `dictation OFF` in the log with nothing
+  after it. How short the window can safely be was measured rather than guessed.
+  Sweeping the refractory from 220 ms to 30 ms over a 350-second recording moved
+  the detection count by exactly one, stable the whole way down: a decaying tail
+  never presents the rise the onset logic looks for, so it cannot re-fire. The
+  binding constraint is the other end — double snaps here run 76–989 ms.
 - **The send snap has to be quick.** Not "snap, then snap" — one gesture, both
   snaps inside `send_window_ms` (1000 ms). Measured double snaps land at
   76–989 ms; the same person snapping twice *casually* lands at 2–7 s, which
@@ -542,6 +561,8 @@ python snap_to_dictate.py --stop
 
 ## Files
 
+What a clone contains:
+
 | File | Purpose |
 |---|---|
 | `snap_to_dictate.py` | Detector, trigger gate, focus guard, key injection, lifecycle |
@@ -550,8 +571,27 @@ python snap_to_dictate.py --stop
 | `config.known-good.json` | Last tuning confirmed to work; `--save-good` / `--restore` |
 | `test_detector.py` | Offline tests: synthetic audio, field-log replay, lifecycle |
 | `run.bat` | Minimised launcher, for running it by hand |
-| `snap.log` | Where the background listener's output goes |
-| `session.wav` | A labelled recording, kept so tuning can be re-run without a mic |
+| `README.md` | This file: what it is and how to use it |
+| `CALIBRATION.md` | Why calibration measures what it measures |
+| `AGENTS.md` | How to install, verify and change it — written for an agent |
+| `LICENSE` | MIT |
+
+And what appears once you run it. **None of these are in the repository** —
+they are produced on your machine and excluded by `.gitignore`:
+
+| File | Produced by |
+|---|---|
+| `snap.log` | the background listener, every time it starts |
+| `calibration/<stamp>.wav` + `.json` | `--calibrate`; see [calibration/README.md](calibration/README.md) |
+| `session.wav` | `--dry-run --record session.wav`, whenever you choose to make one |
+
+That last row matters if you are reading the tuning sections below. They refer
+to `session.wav` as a fixed thing because it was one *here* — a 350-second
+labelled recording that every swept threshold in this repository was measured
+against. Recordings are tens of megabytes of binary that git can only store
+whole, so it is not shipped and a fresh clone will not have it. The numbers it
+produced are shipped, in `config.json` and in the prose; the audio behind them
+is not. To re-sweep anything, record your own and the commands work unchanged.
 
 ```bash
 python test_detector.py
@@ -584,6 +624,7 @@ Send-side keys — the gate that decides whether a message actually goes out:
 | Key | Effect |
 |---|---|
 | `send_window_ms` | how long after a stop a second snap still means "send" |
+| `pair_refractory_ms` | deaf time after a stop, while a confirming snap may follow |
 | `strict_tail_hf_ratio_min` | how bright that confirming snap must still be as it dies |
 | `send_key` | what is pressed to submit |
 | `send_delay_ms` | how long after Ctrl+D to wait for the final transcript |
@@ -596,6 +637,20 @@ Lower `max_decay_ms` when claps or coughs get through.
 
 Honest list of what this does not do yet.
 
+- **A hard keystroke near the microphone measures the same as a snap.** This
+  is the sharpest limit in the tool and it is not a tuning problem. On a
+  calibration recording, 30 seconds of deliberate typing, mouse clicks and chair
+  movement produced 10 detections and 2 spurious sends. Sweeping `abs_floor_db`
+  from -30 to -6 never brought that below 9 without also losing real snaps,
+  because the levels fully overlap — the noises measured -20 to +3 dB and far
+  snaps -14 to +18, so a keystroke is louder than half of them. Shape does not
+  separate them either: one of those transients read `onset_hf` 0.99,
+  `tail_hf` 0.90, decay 52 ms, better shaped than most genuine snaps. A quiet
+  room fires nothing, and normal typing at a normal distance is fine; hammering
+  a mechanical keyboard right beside the mic can occasionally send. The fix is
+  a real feature, not a threshold — requiring the two halves of a double snap
+  to match each other in level and shape, so two keystrokes 350 ms apart no
+  longer pair.
 - **The state machine is open-loop.** Nothing tells the listener whether the app
   is actually recording. Windows does publish it, per-app and in real time, at
   `HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone\Claude_*`
