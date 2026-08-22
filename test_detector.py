@@ -722,6 +722,29 @@ check("the listener logs titles through loggable()",
 check("...but resolves profiles against the raw title",
       "resolve_profile(exe, title" in inspect.getsource(_s.listen), True)
 
+# --- the stop guard records what it does not yet use -------------------------
+# Four numbers were measured against a real session and none of them separates
+# a stop the user wanted from one they undid: attack, crest, tail_hf, decay,
+# peak and recording length all overlap, and the level the guard itself
+# measures had the same median, 6 dB, in both cases. The level BEFORE the
+# transient is the one question never asked. It is logged now and gates
+# nothing, and these checks hold that line: recorded, and still not acted on.
+_rp = inspect.getsource(_s.resolve_pending)
+check("the stop guard records the level before the transient",
+      "det.speech_db(pending[\"ev\"][\"onset_block\"], -800, -100)" in _rp, True)
+check("...on the stop it allows",
+      _rp.count("heard += was") == 1, True)
+check("...and on the stop it rejects",
+      "not a stop%s" in _rp, True)
+# Counted over code lines only, because the phrase "if before is None" in the
+# formatting ternary is not a decision about the stop and a substring search
+# reads it as one.
+_uses = [l.strip() for l in _rp.splitlines()
+         if "before" in l and not l.strip().startswith("#")]
+check("...and 'before' is only ever measured and formatted, never tested",
+      _uses, ['before = det.speech_db(pending["ev"]["onset_block"], -800, -100)',
+              'was = "" if before is None else "  [before %.0f dB]" % before'])
+
 # README quotes concrete numbers at the reader, and those numbers are promises
 # about what the tool will do. They came adrift once already: calibration wrote
 # send_window_ms 750, double_min_ms 228 and double_max_ms 911 into config.json,

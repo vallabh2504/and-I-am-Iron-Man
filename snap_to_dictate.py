@@ -1906,6 +1906,24 @@ def resolve_pending(pending, det, cfg, dry_run, events, state, since,
     prof = pending["prof"]
     lo_ms, hi_ms = cfg["speech_window_ms"]
     level = det.speech_db(pending["ev"]["onset_block"], lo_ms, hi_ms)
+
+    # Recorded, not yet acted on. The guard below asks one question - was the
+    # room loud just after the transient - and measurement says that question
+    # cannot tell a wanted stop from an unwanted one. Across 80 stops in a real
+    # session the level after was a median 6 dB whether the user kept the stop
+    # or immediately snapped dictation back on. Every other number already in
+    # this log failed the same test: attack, crest, tail_hf, decay, peak and
+    # the length of the recording all overlap between the two cases.
+    #
+    # What the room was doing just BEFORE the transient is a different question,
+    # and one nothing here has ever asked. A deliberate stop comes after the
+    # speaker has finished a sentence; a false one lands in the middle of it. The
+    # detector already keeps 1741 ms of history, so the answer costs nothing but
+    # a log column. It changes no decision. It is here so that ordinary use
+    # labels itself: a stop the user did not want is the one they undo, and that
+    # undo is already visible in this file.
+    before = det.speech_db(pending["ev"]["onset_block"], -800, -100)
+    was = "" if before is None else "  [before %.0f dB]" % before
     waited = (time.monotonic() - pending["at"]) * 1000.0
     if level is None and waited < PENDING_TIMEOUT_MS:
         return state, since, pending
@@ -1913,11 +1931,12 @@ def resolve_pending(pending, det, cfg, dry_run, events, state, since,
     stamp = time.strftime("%H:%M:%S")
     if level is not None and level >= cfg["speech_over_floor_db"]:
         print("[%s] snap    %s  still talking %.0f dB over the floor "
-              "%.0f-%.0f ms later; not a stop"
-              % (stamp, pending["detail"], level, lo_ms, hi_ms))
+              "%.0f-%.0f ms later; not a stop%s"
+              % (stamp, pending["detail"], level, lo_ms, hi_ms, was))
         return state, since, None
 
     heard = "quiet" if level is None else "%.0f dB over the floor" % level
+    heard += was
     if dry_run:
         print("[%s] TRIGGER %s  %s after; would stop (dry run)"
               % (stamp, pending["detail"], heard))
