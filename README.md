@@ -1,4 +1,10 @@
+![Snap once to start dictating, snap again to stop, snap twice to send. The snap is detected locally on your own machine and the keystroke goes to whichever app is in front.](docs/banner.png)
+
 # Snap-To-Dictate
+
+The repository is named `and-I-am-Iron-Man`. The tool inside it is called
+Snap-To-Dictate. One name is the idea and the other is what it does, and they
+are the same project.
 
 **Snap your fingers to start dictating. Snap again to stop. Snap twice to
 send.**
