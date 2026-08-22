@@ -708,3 +708,16 @@ verdict. Two thresholds can then be compared on identical audio, which is the
 only comparison that means anything — a fresh performance differs in a dozen
 uncontrolled ways. Leaving a clear gap of silence between the sounds you want
 detected and the ones you do not makes the recording self-labelling.
+
+## License
+
+MIT. See [LICENSE](LICENSE). Use it, change it, ship it — the only condition is
+that the copyright notice travels with the copies.
+
+## For agents
+
+If you are an LLM agent asked to install, verify or modify this repository,
+read [AGENTS.md](AGENTS.md) instead of this file. It has the install contract
+(`--verify`, which exits non-zero when the tool cannot work), the architecture
+with source-line citations, and four invariants that must not be broken. Then
+run `python test_detector.py` before concluding a change is fine.
