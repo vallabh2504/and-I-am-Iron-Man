@@ -456,11 +456,17 @@ check("...without going to nothing at all", _pair_ms >= 30.0, True)
 
 print(NL_ + "per-app routing")
 
-ROUTING = {"profiles": DEFAULTS["profiles"]}
+ROUTING = {"profiles": DEFAULTS["profiles"]}       # no catch-all configured
+CATCHALL = {"profiles": DEFAULTS["profiles"],      # ...and with one
+            "fallback": DEFAULTS["fallback"]}
 
 
 def route(exe, title):
     return resolve_profile(exe, title, ROUTING)
+
+
+def route_all(exe, title=""):
+    return resolve_profile(exe, title, CATCHALL)
 
 
 check("the Claude desktop window routes to dictation",
@@ -483,7 +489,11 @@ check("...in both directions",
 # editor.
 check("an editor open on a folder named CODEX is not Codex",
       (route("antigravity ide.exe", "CODEX - Antigravity IDE") or {}).get("name"),
-      "Antigravity IDE")
+      None)
+check("...and is still not Codex once a catch-all exists",
+      "Codex" in (route_all("antigravity ide.exe",
+                            "CODEX - Antigravity IDE") or {}).get("name", ""),
+      False)
 check("nor is a browser tab that mentions Codex",
       route("msedge.exe", "Codex - Profile 1 - Microsoft Edge"), None)
 
@@ -498,10 +508,11 @@ check("a terminal matches no profile",
 check("only apps with a confirmed shortcut may send",
       [p["name"] for p in DEFAULTS["profiles"] if profile_ready(p)],
       ["Claude desktop", "Codex", "ChatGPT", "Antigravity"])
-check("an unconfirmed profile still resolves",
-      (route("code.exe", "x - Visual Studio Code") or {}).get("name"), "VS Code")
-check("...but is not allowed to press anything",
-      profile_ready(route("code.exe", "x - Visual Studio Code")), False)
+check("an app whose own shortcut is unknown gets nothing on its own",
+      route("code.exe", "x - Visual Studio Code"), None)
+check("...and reaches the system-wide key instead when one is configured",
+      (route_all("code.exe", "x - Visual Studio Code") or {}).get("activate"),
+      "ctrl+space")
 
 # The two Antigravity programs are separate installs with separate
 # executables, and only the desktop app is wired. Matching is on the whole
@@ -625,6 +636,45 @@ check("no delayed send in resolve_pending bypasses the guard",
       "send_key(" in _deferred.replace("send_key_if_focused(", ""), False)
 check("the guard is reached from all three delayed sends",
       _src.count("send_key_if_focused("), 4)   # 1 definition + 3 call sites
+
+# Windows refuses SendInput with error 5 when the foreground window runs at a
+# higher integrity level, and the catch-all made that reachable from any window
+# rather than only from an app somebody wired up on purpose. Twice on
+# 2026-08-23 the unhandled OSError ended the listener mid-session.
+def _refusing(fn, *a):
+    """Run fn with send_key replaced by one that fails the way Windows does."""
+    real = _s.send_key
+
+    def boom(mod_vks, key_vk):
+        raise OSError("SendInput sent 0/4, error 5.")
+
+    _s.send_key = boom
+    try:
+        return fn(*a)
+    finally:
+        _s.send_key = real
+
+
+_CLAUDE = next(p for p in ROUTING["profiles"] if p["name"] == "Claude desktop")
+check("a keystroke Windows refuses does not raise",
+      _refusing(_s.send_key_guarded, (), 0x20, _CLAUDE, "the start"), False)
+
+_real_fg = _s.foreground_window
+_s.foreground_window = lambda: ("claude.exe", "Claude")
+try:
+    check("...and the delayed guard reports it as not sent, rather than dying",
+          _refusing(_s.send_key_if_focused, (), 0x20, _CLAUDE, ROUTING,
+                    "the stop"), False)
+finally:
+    _s.foreground_window = _real_fg
+
+# Every send inside the listen loop has to go through one of the two guarded
+# forms, or one refused keystroke ends the process for every other window too.
+_listen = _src[_src.index("def listen"):]
+_listen = _listen[:_listen.index(NL_ + "def ", 10)]
+check("no send inside the listen loop bypasses the guard",
+      "send_key(" in _listen.replace("send_key_guarded(", "")
+      .replace("send_key_if_focused(", ""), False)
 
 
 # ------------------------------------------- calibration matches its document
@@ -878,6 +928,56 @@ check("the stop-gesture count is what the document asks for",
 # the microphone, must notice --stop, and must be able to tell whether Claude
 # Code is still running. Uses a private event name so a live listener that
 # happens to be running right now is left alone.
+
+
+# --- the catch-all, and the windows it must refuse ---------------------------
+# Every other profile names the window it may type into. This one does not, so
+# it is the only profile whose safety is a list rather than a match, and these
+# checks are that list. The send is what makes it dangerous: a double snap
+# presses Enter, and Enter runs the command line in a shell, opens the selected
+# icon on the desktop, and answers Yes on a UAC prompt.
+for _exe in sorted(_s.NEVER_FALLBACK):
+    check("the catch-all refuses %s" % _exe, route_all(_exe), None)
+
+check("a window with no identifiable process gets nothing", route_all(""), None)
+check("every terminal is inside the refusal list",
+      _s.TERMINALS <= _s.NEVER_FALLBACK, True)
+check("the desktop shell is refused, because Enter opens what is selected",
+      "explorer.exe" in _s.NEVER_FALLBACK, True)
+
+# An app that IS wired keeps its own key. The catch-all is a last resort, not
+# an override, or a snap in Claude would press the system key instead of ctrl+d.
+check("a wired app still uses its own shortcut",
+      route_all("claude.exe", "Claude")["activate"], "ctrl+d")
+check("...and an unwired one gets the system-wide key",
+      route_all("chrome.exe", "New Tab")["activate"], "ctrl+space")
+
+# Load-bearing, not cosmetic. send_key_if_focused re-checks focus by comparing
+# profile NAMES, so if every unwired app shared one name a gesture begun in a
+# browser could finish by typing into a text editor the user alt-tabbed to.
+check("each unwired app resolves under its own name",
+      route_all("chrome.exe")["name"] == route_all("notepad.exe")["name"], False)
+check("...and the name says which app it was",
+      "chrome.exe" in route_all("chrome.exe")["name"], True)
+
+# A parked profile is oneshot; the catch-all is dictation. What runs in that
+# window is the catch-all whole, so the mode has to come from it too. Reading
+# the mode off the parked profile would promise a gesture nobody gets.
+check("a parked profile falls through with the catch-all's mode",
+      route_all("code.exe", "x - Visual Studio Code")["mode"], "dictation")
+check("...and the profile it fell through from was not itself dictation",
+      [p["mode"] for p in DEFAULTS["profiles"]
+       if p["process"] == "code.exe"], ["oneshot"])
+check("the startup banner reports the catch-all's mode, not the parked one",
+      'prof["mode"], fb["activate"]' in _src, False)
+
+# Turning it off has to actually turn it off.
+check("disabling the catch-all silences every unwired app",
+      resolve_profile("chrome.exe", "", {"profiles": DEFAULTS["profiles"],
+          "fallback": dict(DEFAULTS["fallback"], enabled=False)}), None)
+check("...and so does leaving its key unset",
+      resolve_profile("chrome.exe", "", {"profiles": DEFAULTS["profiles"],
+          "fallback": dict(DEFAULTS["fallback"], activate=None)}), None)
 
 print("\nlifecycle plumbing")
 TEST_EVENT = "Local\\SnapToDictate.selftest"

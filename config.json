@@ -100,5 +100,12 @@
     }
   ],
   "watch_grace_s": 30.0,
-  "watch_poll_s": 5.0
+  "watch_poll_s": 5.0,
+  "fallback": {
+    "name": "Windows voice typing",
+    "mode": "dictation",
+    "activate": "ctrl+space",
+    "send": "enter",
+    "enabled": true
+  }
 }

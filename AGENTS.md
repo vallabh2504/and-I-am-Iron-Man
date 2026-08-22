@@ -22,8 +22,10 @@ presses a keyboard shortcut into whichever window is in front. One snap toggles
 dictation in the app you are looking at. Two fast snaps stop dictation and
 submit. Which shortcut gets pressed depends on which app has focus, so the same
 gesture drives the Claude desktop app, ChatGPT, Codex and an IDE without you
-telling it which one you meant. It is Windows only, because it is built on
-`SendInput` and the Win32 foreground-window API.
+telling it which one you meant. An app with no profile of its own falls through
+to Windows' built-in voice typing, so the gesture is the same everywhere except
+in a short list of windows it deliberately refuses to touch. It is Windows only,
+because it is built on `SendInput` and the Win32 foreground-window API.
 
 ---
 
@@ -105,6 +107,7 @@ you are at. Do not stall on a human step and do not pretend you performed it.
 | Registering the logon scheduled task | agent alone, one condition | Run the PowerShell from *Autostart at logon* in README.md. It reads the repository path, the interpreter path, `$env:USERNAME` and `$env:COMPUTERNAME` from the environment, so it needs no editing, but it has to run from inside the repository **in the human's own interactive session** and register for that same user. `-RunLevel Limited` and `-LogonType Interactive` are load-bearing and both fail in ways that are hard to trace. |
 | Choosing the microphone | agent asks the human one thing | Run `--list-devices` yourself, show them the list, and ask which index is the microphone they actually talk into. You cannot hear the room. |
 | Finding an app's dictation shortcut | human | It is in that app's own settings or keyboard shortcut list. It is not in this repository and cannot be derived from it. Ask the human for the key by name. A shortcut you found anywhere other than their app is a guess. |
+| Confirming the catch-all key | human | `ctrl+space` ships enabled and reaches **every** app that has no profile of its own, so it is the one default that is armed before anybody on this machine has confirmed it. Windows' own documented shortcut for voice typing is `win+h`. Ask the human to focus an ordinary window, run `--test-key --key ctrl+space`, and say whether the dictation bar appeared. If it did not, change `fallback.activate` or turn the catch-all off. Do not leave a key firing into every app on a guess. |
 | `python snap_to_dictate.py --whoami` | human | It counts down and then reads whichever window is focused at the end of the count. The human has to click the window they want identified. If you run it, it identifies your own terminal and tells you nothing. Ask them to run it and paste back the process, title and profile lines. |
 | `python snap_to_dictate.py --test-key --key <candidate>` | human | The target window has to be focused when the count ends, and somebody has to watch whether the app reacted. `SendInput` reporting success only means the keystroke left this process. Ask them what the app did, and treat "nothing happened" as a wrong key rather than a wrong tool. |
 | `python snap_to_dictate.py --calibrate` | human | All seven passes, and every one of them is a performance. They sit quiet, snap ten times from where they sit, snap ten times from across the room, talk for a minute without snapping, type and click and shift in the chair, snap ten pairs, then talk-snap-stop eight times. 237 seconds of recording and about five minutes of their time. Hand them CALIBRATION.md and wait. |
@@ -119,7 +122,8 @@ you are at. Do not stall on a human step and do not pretend you performed it.
    anything.
 4. Ask the human which apps they want to drive and what each one's dictation
    shortcut is. This is the single question the whole setup turns on, and it is
-   the one thing you cannot look up.
+   the one thing you cannot look up. An app they do not name is not left out of
+   the tool; it falls through to the catch-all in step 8.
 5. Ask them to run `--whoami` once per app, clicking that app's window during
    the countdown, and to paste back what it printed.
 6. Write a profile per app into `config.json` using those process and title
@@ -127,12 +131,19 @@ you are at. Do not stall on a human step and do not pretend you performed it.
 7. Ask them to focus each window and run `--test-key --key <their key>`, and to
    tell you whether the app reacted. Set `"enabled": true` only for the ones
    that did.
-8. `python snap_to_dictate.py --verify` again. The waiting-profile `WARN`
-   should have gone for everything you enabled, and the terminal check should
-   still be `OK`.
-9. Ask whether they want it running at logon. If they do, register the
-   scheduled task from *Autostart at logon* in README.md.
-10. Leave calibration alone unless snaps are being missed or false ones are
+8. Ask them to focus an ordinary window, one no profile claims, run
+   `--test-key --key ctrl+space`, and say whether Windows' dictation bar
+   appeared. That is the catch-all, and it is the one key that ships armed,
+   so it gets confirmed after the fact rather than before. If nothing
+   happened, set `fallback.activate` to the key that does work on their
+   machine, or `fallback.enabled` to `false`.
+9. `python snap_to_dictate.py --verify` again. The terminal check and the
+   refusal-list check should both still be `OK`. The waiting-profile note is
+   `OK` whenever the catch-all is on, so it will not tell you which profiles
+   you enabled. Read the routing line the listener prints at startup for that.
+10. Ask whether they want it running at logon. If they do, register the
+    scheduled task from *Autostart at logon* in README.md.
+11. Leave calibration alone unless snaps are being missed or false ones are
     getting through. If they are, hand them CALIBRATION.md and ask them to run
     `--calibrate`.
 
@@ -163,6 +174,23 @@ means the app is wired up and waiting for somebody to find its shortcut.
 rather than a `FAIL`, precisely so you can leave it there honestly instead of
 filling it in to make a warning go away.
 
+The catch-all is the one exception, and it is worth naming as an exception
+rather than letting you find it. `fallback.activate` ships as `ctrl+space`,
+enabled, and it reaches **every** app that has no profile of its own. Nobody on
+the machine you are setting up has confirmed it. It ships that way because the
+alternative, an unwired app doing nothing at all, is the exact thing the feature
+exists to remove, and because `ctrl+space` is comparatively cheap to be wrong
+about: where it is not Windows voice typing it is usually nothing, an
+input-method toggle, or a completion popup. Cheap is not free. In Excel it
+selects the whole column.
+
+That reasoning covers `activate` and does not extend to `send`. The catch-all
+presses `enter` after a stop, into whatever is in front, and an `enter` in the
+wrong window runs a command line or clicks Yes on a prompt. `NEVER_FALLBACK` is
+what bounds that, which is why the next section says to add to that list and
+never cut from it. Confirming `ctrl+space` with `--test-key` is a step you owe
+the human, not one you skip because no warning is showing.
+
 ---
 
 ## Architecture
@@ -176,14 +204,14 @@ two multiples of 5.805 behaves exactly like the lower one.
 microphone
     │  256-sample blocks
     ▼
-SnapDetector.push()                  snap_to_dictate.py:236
+SnapDetector.push()                  snap_to_dictate.py:258
     │  per-block rFFT, high band 1500-16000 Hz vs an EMA noise floor
     │  ONSET gates  ─► VERIFY gates ─► one event with five features
     ▼
 event {peak_db, onset_hf, tail_hf, decay_ms, attack_ms, crest}
     │
     ▼
-TriggerGate.offer()                  snap_to_dictate.py:507
+TriggerGate.offer()                  snap_to_dictate.py:529
     │  refractory, single-vs-double pairing, the send window
     ▼
 listen() state machine               IDLE / RECORDING / SETTLING
@@ -201,9 +229,10 @@ counting the wrong thing. The event is the unit.
 
 | You want to change | Go to |
 |---|---|
-| what counts as a snap | `SnapDetector` gates, `snap_to_dictate.py:236` |
-| single vs double, pairing windows | `TriggerGate`, `snap_to_dictate.py:507` |
-| which key goes to which app | `resolve_profile`, `snap_to_dictate.py:766` |
+| what counts as a snap | `SnapDetector` gates, `snap_to_dictate.py:258` |
+| single vs double, pairing windows | `TriggerGate`, `snap_to_dictate.py:529` |
+| which key goes to which app | `resolve_profile`, `snap_to_dictate.py:823` |
+| what an app with no profile gets | `fallback_profile`, `snap_to_dictate.py:855` |
 | the dictation on/off/submit flow | `listen()` and `resolve_pending` |
 | what calibration measures | `CAL_PASSES` and `derive()`, and CALIBRATION.md with it |
 | install checks | `cmd_verify`, `snap_to_dictate.py` |
@@ -253,8 +282,68 @@ comparisons elsewhere in the program are done by **profile name, never by
 process**, because two profiles can share an executable.
 
 A disabled profile with `"activate": null` is a legitimate placeholder. The app
-is wired up and waiting for somebody to find its dictation shortcut.
-`profile_ready()` refuses to send for it, and `--verify` reports it as a `WARN`.
+is wired up and waiting for somebody to find its dictation shortcut. It does not
+sit idle: as of the catch-all below it falls through to Windows' own dictation
+instead, and `--verify` says so.
+
+### The catch-all
+
+`fallback_profile` (`snap_to_dictate.py:855`) builds a profile on the spot for
+any window that no entry in `profiles` claimed. It ships enabled, so an app
+nobody wired up behaves like one that was, using Windows' own voice typing.
+
+```json
+"fallback": {
+  "name": "Windows voice typing",
+  "mode": "dictation",
+  "activate": "ctrl+space",
+  "send": "enter",
+  "enabled": true
+}
+```
+
+The fields mean what they mean in a profile. There is no `process` or `title`,
+because not matching is the point. Three things about it are load-bearing rather
+than cosmetic, and each has tests.
+
+**It refuses 17 processes and every window it cannot identify.**
+`NEVER_FALLBACK` is the `TERMINALS` list plus seven more: `explorer.exe`,
+`consent.exe`, `logonui.exe`, `credentialuibroker.exe`, `taskmgr.exe`,
+`lsass.exe`, `winlogon.exe`. Terminals are there for invariant 1. The rest are
+there because `enter` in those windows opens the selected icon, clicks Yes on a
+UAC prompt, submits a password box or ends a task. `fallback_profile` also
+returns `None` when the executable name is empty, so a window nothing can
+identify gets nothing rather than the default. `--verify` re-derives the whole
+refusal by calling `fallback_profile` on every name in the list, so it checks
+the refusal instead of trusting it. **Add to this list. Do not cut from it.**
+
+**Each window gets its own profile name**, `Windows voice typing [chrome.exe]`.
+That is the safety property, not a display detail. `send_key_if_focused`
+re-checks focus by comparing profile **names**, so a gesture begun in Chrome and
+finished after an alt-tab to Notepad is dropped rather than completed in the
+wrong app. One shared name across every unwired app would have removed that
+protection silently, because everything would have compared equal.
+
+**A profile that cannot press anything falls through to it.** `resolve_profile`
+breaks out of its loop when the matched profile fails `profile_ready()`, rather
+than returning it, so the parked `Antigravity IDE` and `VS Code` entries now
+work through Windows. Two consequences. Enabling a parked profile changes
+*which* key is sent, not *whether* one is; and what runs in that window is the
+catch-all whole, including its `mode`, so a parked `oneshot` profile still gives
+the snap-on, snap-off, double-snap-to-send gesture.
+
+**A keystroke Windows refuses is logged, not fatal.** `SendInput` fails with
+error 5 when the foreground window runs at a higher integrity level, and the
+catch-all made that reachable from any window rather than only from an app
+somebody wired up on purpose. `send_key_guarded` catches it, prints `refused`,
+and returns False; every send inside `listen` goes through it or through
+`send_key_if_focused`, and a test asserts no bare `send_key` is left on those
+paths. Callers treat False as "the app was not touched" and leave state where
+it was, so a refused start does not put the loop into `RECORDING` waiting to
+stop a dictation that never began.
+
+Set `"enabled": false` on `fallback`, or its `activate` to `null`, and every
+window without a profile of its own goes back to being ignored.
 
 ---
 
@@ -269,6 +358,11 @@ desktop app and *end of input in every shell*. A stop that lands in a terminal
 closes it, and when that terminal is running an agent, the agent dies mid-task.
 The program carries a `TERMINALS` list. `--verify` checks every entry against
 the live config, and the test suite checks it against the shipped one.
+
+The catch-all matches every window by construction, so it would have driven
+straight through this invariant if nothing stopped it. `fallback_profile`
+refuses `NEVER_FALLBACK`, which is `TERMINALS` plus seven more, and refuses any
+window whose executable it cannot read. That is checked the same two ways.
 
 **2. A delayed keystroke must re-read focus immediately before pressing.** Three
 sends happen later than the focus check that authorised them. A held stop waits

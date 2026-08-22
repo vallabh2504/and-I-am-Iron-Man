@@ -209,6 +209,28 @@ DEFAULTS = {
          "enabled": False},
     ],
 
+    # --- the catch-all, for every app with no profile of its own -------------
+    # Windows has its own dictation, it works in any window that takes text,
+    # and it needs no per-app shortcut. So an app nobody has wired up is not
+    # necessarily out of reach: press the system dictation key instead of an
+    # app key and the same snap gesture works everywhere.
+    #
+    # This is the one profile that matches on nothing, which is exactly why it
+    # is the dangerous one. Every other profile names the window it may type
+    # into. This one types into whatever is in front, so the safety is not in
+    # what it matches but in what it refuses to - see NEVER_FALLBACK.
+    #
+    # "activate" ships as ctrl+space because that is what the author confirmed
+    # on this machine. Windows' own documented voice-typing shortcut is win+h;
+    # if ctrl+space does nothing on your machine, that is the first thing to
+    # try. Confirm it with --test-key before trusting it, the same as any
+    # other shortcut here, because a wrong key here reaches every app rather
+    # than one.
+    "fallback": {
+        "name": "Windows voice typing", "mode": "dictation",
+        "activate": "ctrl+space", "send": "enter", "enabled": True,
+    },
+
     # --- lifecycle, for --follow ---
     "watch_grace_s": 30.0,              # ...releasing it this long after they go
     "watch_poll_s": 5.0,
@@ -759,6 +781,41 @@ def legacy_profile(cfg):
             for p in cfg["target_processes"]]
 
 
+# Every shell this has been able to name. Ctrl+D is end-of-input in all of
+# them and it is how the Claude Code CLI exits, so a stop that landed on one
+# would close a session rather than stop dictation. No profile may match one,
+# and --verify fails the install if any does.
+TERMINALS = frozenset({
+    "windowsterminal.exe", "powershell.exe", "pwsh.exe", "cmd.exe",
+    "conhost.exe", "wezterm-gui.exe", "alacritty.exe", "kitty.exe",
+    "hyper.exe", "mintty.exe",
+})
+
+# What the catch-all refuses to type into, on top of every terminal.
+#
+# A named profile is safe because it names its window. The catch-all has no
+# such limit, so its safety has to be written down instead, and the thing that
+# makes a window unsafe is not dictation - it is the send. A double snap sends
+# Enter, and Enter is not a neutral key everywhere:
+#
+#   a terminal            runs whatever is on the command line
+#   explorer.exe          opens the selected icon; it is also the desktop and
+#                         the taskbar, which is the foreground window whenever
+#                         nothing else is
+#   consent.exe           the UAC prompt. Enter is Yes.
+#   LogonUI.exe,          the lock screen and the credential dialogs, where
+#   CredentialUIBroker    keystrokes go into a password box
+#   Taskmgr.exe           Enter is End Task on the selected process
+#
+# Extend this rather than removing from it. An app wrongly left out gets no
+# dictation, which the log says plainly; an app wrongly let in gets a keystroke
+# nobody asked for.
+NEVER_FALLBACK = TERMINALS | frozenset({
+    "explorer.exe", "consent.exe", "logonui.exe", "credentialuibroker.exe",
+    "taskmgr.exe", "lsass.exe", "winlogon.exe",
+})
+
+
 def profiles_of(cfg):
     return cfg.get("profiles") or legacy_profile(cfg)
 
@@ -783,13 +840,78 @@ def resolve_profile(exe, title, cfg):
         pattern = prof.get("title")
         if pattern and not re.search(pattern, title or ""):
             continue
+        # A profile that cannot press anything must not block the catch-all.
+        # Antigravity IDE and VS Code are here precisely because their own
+        # dictation keys are wrong or missing, and a named profile with no key
+        # is a statement that this app has no shortcut of its own - which is
+        # the exact case the system-wide key exists to cover. First match still
+        # wins; this only decides whether the match can act.
+        if not profile_ready(prof):
+            break
         return prof
-    return None
+    return fallback_profile(exe, cfg)
+
+
+def fallback_profile(exe, cfg):
+    """The catch-all for a window no profile claimed, or None to leave it alone.
+
+    Three things must be true before an unwired window is sent anything. The
+    fallback has to be configured and enabled. The window has to have a process
+    name at all, because a window that cannot be identified cannot be vouched
+    for. And that process must not be on NEVER_FALLBACK, where Enter does
+    something no snap should be able to do.
+
+    The name carries the process, and that is load-bearing rather than
+    cosmetic. send_key_if_focused re-checks focus by comparing profile NAMES,
+    so a gesture begun in one unwired app cannot finish in another: start
+    dictating in a browser, alt-tab to a text editor, and the two windows
+    resolve to different names, so the stop is withheld instead of typed into
+    the editor. A single shared name would have let it through.
+
+    Returned as an ordinary profile so nothing downstream needs to know it is
+    special - profile_ready, the focus re-check and the state machine all treat
+    it exactly like a named one.
+    """
+    prof = cfg.get("fallback")
+    if not prof or not prof.get("enabled") or not prof.get("activate"):
+        return None
+    if not exe or exe in NEVER_FALLBACK:
+        return None
+    return dict(prof, process=exe, name="%s [%s]" % (prof["name"], exe))
 
 
 def profile_ready(prof):
     """True if this profile is allowed to send a keystroke."""
     return bool(prof and prof.get("enabled") and prof.get("activate"))
+
+
+def send_key_guarded(mod_vks, key_vk, prof, what):
+    """send_key, but a refusal by Windows is logged instead of fatal.
+
+    SendInput fails with error 5 when the foreground window belongs to a
+    process running at a higher integrity level than this one. UIPI blocks the
+    keystroke on purpose and nothing is wrong with the key, the audio or the
+    config. It is not recoverable either: the only fix is to run one of the two
+    at the other's level, and that is a decision for the person, not the loop.
+
+    Before the catch-all existed this could only happen in an app somebody had
+    deliberately wired up, so letting the exception end the process was at
+    least honest. The catch-all types into whatever is in front, which includes
+    installers, admin terminals and anything started as administrator, and an
+    unhandled OSError there takes the listener down for every other window too.
+    It did exactly that twice on 2026-08-23, both times mid-session with no
+    indication beyond the process being gone.
+
+    Returns True if the keystroke left this process. Callers must treat False
+    as "the app was not touched" and leave their state where it was.
+    """
+    try:
+        send_key(mod_vks, key_vk)
+        return True
+    except OSError as exc:
+        print("[%s] refused %s for %s: %s"
+              % (time.strftime("%H:%M:%S"), what, prof["name"], exc))
+        return False
 
 
 def send_key_if_focused(mod_vks, key_vk, prof, cfg, what):
@@ -817,8 +939,7 @@ def send_key_if_focused(mod_vks, key_vk, prof, cfg, what):
     exe, title = foreground_window()
     now = resolve_profile(exe, title, cfg)
     if now is not None and now["name"] == prof["name"]:
-        send_key(mod_vks, key_vk)
-        return True
+        return send_key_guarded(mod_vks, key_vk, prof, what)
     where = "%s%s" % (exe, (" [%s]" % loggable(title)) if title else "")
     print("[%s] dropped %s for %s; focus moved to %s"
           % (time.strftime("%H:%M:%S"), what, prof["name"], where))
@@ -2073,16 +2194,39 @@ def listen(cfg, dry_run, instance, watch, record=None):
         where = prof["process"] + (" [%s]" % prof["title"]
                                    if prof.get("title") else "")
         if not profile_ready(prof):
-            why = ("no key yet" if not prof.get("activate")
-                   else "disabled: %s untested" % prof["activate"])
-            print("    %-34s %-11s -- nothing sent (%s)"
-                  % (where, prof["mode"], why))
+            # It falls through to the catch-all rather than doing nothing, so
+            # saying "nothing sent" here would be false. Which of the two it is
+            # depends on whether the catch-all is on, so read it, do not assume.
+            fb = cfg.get("fallback") or {}
+            if fb.get("enabled") and fb.get("activate"):
+                # The mode shown is the catch-all's, not this profile's. What
+                # runs in that window is the catch-all whole, so printing the
+                # parked profile's mode here would promise a gesture nobody
+                # will get - a oneshot row that is really snap-on, snap-off.
+                print("    %-34s %-11s -> catch-all (%s)"
+                      % (where, fb.get("mode", "-"), fb["activate"]))
+            else:
+                why = ("no key yet" if not prof.get("activate")
+                       else "disabled: %s untested" % prof["activate"])
+                print("    %-34s %-11s -- nothing sent (%s)"
+                      % (where, prof["mode"], why))
         elif prof["mode"] == "dictation":
             print("    %-34s %-11s snap %s on/off, snap twice -> %s"
                   % (where, prof["mode"], prof["activate"], prof["send"]))
         else:
             print("    %-34s %-11s snap -> %s"
                   % (where, prof["mode"], prof["activate"]))
+
+    fb = cfg.get("fallback") or {}
+    if fb.get("enabled") and fb.get("activate"):
+        print("    %-34s %-11s snap %s on/off, snap twice -> %s"
+              % ("everything else", fb["mode"], fb["activate"], fb["send"]))
+        print("    %-34s %-11s -- never, whatever is in front"
+              % ("  except " + ", ".join(sorted(NEVER_FALLBACK)[:3]) + ", ...",
+                 "%d apps" % len(NEVER_FALLBACK)))
+    else:
+        print("    %-34s %-11s -- nothing sent (catch-all is off)"
+              % ("everything else", "-"))
 
     with open_stream(cfg, cb):
         last_seen = time.monotonic()
@@ -2199,8 +2343,8 @@ def listen(cfg, dry_run, instance, watch, record=None):
                     print("[%s] TRIGGER %s  focus=%s  would send %s to %s "
                           "(dry run)" % (stamp, detail, where,
                                          prof["activate"], prof["name"]))
-                else:
-                    send_key(mod_vks, key_vk)
+                elif send_key_guarded(mod_vks, key_vk, prof,
+                                      prof["activate"]):
                     print("[%s] TRIGGER %s  -> %s  %s activated"
                           % (stamp, detail, prof["activate"], prof["name"]))
                 state, since, active = IDLE, time.monotonic(), None
@@ -2216,7 +2360,12 @@ def listen(cfg, dry_run, instance, watch, record=None):
                 print("[%s] TRIGGER %s  focus=%s  would %s in %s (dry run)"
                       % (stamp, detail, where, action, prof["name"]))
             elif action == "start":
-                send_key(mod_vks, key_vk)
+                # Refused means nothing started over there, so fall out without
+                # touching state. Moving to RECORDING here would leave the loop
+                # waiting to stop a dictation that never began.
+                if not send_key_guarded(mod_vks, key_vk, prof,
+                                        prof["activate"]):
+                    continue
                 print("[%s] TRIGGER %s  -> %s  %s dictation ON"
                       % (stamp, detail, prof["activate"], prof["name"]))
             elif action == "stop":
@@ -2228,7 +2377,12 @@ def listen(cfg, dry_run, instance, watch, record=None):
                           % (stamp, detail))
                     det.expect_pair()
                     continue
-                send_key(mod_vks, key_vk)
+                # Same reasoning as the start, one step on: a refused stop
+                # means that app is still recording, so stay in RECORDING and
+                # let the next snap read as the stop it was always meant to be.
+                if not send_key_guarded(mod_vks, key_vk, prof,
+                                        prof["activate"]):
+                    continue
                 print("[%s] TRIGGER %s  -> %s  dictation OFF (snap again "
                       "within %.0f ms to send)"
                       % (stamp, detail, prof["activate"], cfg["send_window_ms"]))
@@ -2364,13 +2518,6 @@ def cmd_run(cfg, dry_run, config_path, follow=False,
     return 0
 
 
-TERMINALS = frozenset({
-    "windowsterminal.exe", "powershell.exe", "pwsh.exe", "cmd.exe",
-    "conhost.exe", "wezterm-gui.exe", "alacritty.exe", "kitty.exe",
-    "hyper.exe", "mintty.exe",
-})
-
-
 def cmd_verify(cfg, config_path, as_json=False):
     """Check an installation and say plainly what is wrong with it.
 
@@ -2492,9 +2639,29 @@ def cmd_verify(cfg, config_path, as_json=False):
     live_profiles = [p for p in profiles if p.get("enabled")]
     note("OK" if not bad else "FAIL", "every enabled profile is complete",
          "all %d" % len(live_profiles) if not bad else "; ".join(bad))
+    # ---- the catch-all -----------------------------------------------------
+    # Reported before the waiting list below, because whether an unconfigured
+    # profile is a problem depends entirely on whether this is on.
+    fb = cfg.get("fallback") or {}
+    on = bool(fb.get("enabled") and fb.get("activate"))
+    note("OK" if on else "WARN", "catch-all for unwired apps",
+         ("%s in any app with no profile of its own; refuses %d processes"
+          % (fb["activate"], len(NEVER_FALLBACK))) if on
+         else "off, so an app with no profile of its own gets nothing")
+    if on:
+        # The list is the only thing standing between a double snap and an
+        # Enter pressed into a shell, so it is checked rather than trusted.
+        leaked = sorted(e for e in NEVER_FALLBACK
+                        if (fallback_profile(e, cfg) is not None))
+        note("OK" if not leaked else "FAIL", "the refusal list holds",
+             "all %d refused" % len(NEVER_FALLBACK) if not leaked
+             else "REACHES " + ", ".join(leaked))
+
     if waiting:
-        note("WARN", "profiles waiting to be configured",
-             "%s - disabled, no activate key set yet" % ", ".join(waiting))
+        note("OK" if on else "WARN", "profiles waiting to be configured",
+             "%s - no key of their own, %s"
+             % (", ".join(waiting),
+                "so they use the catch-all" if on else "and no catch-all is on"))
 
     # ---- the safety property ----------------------------------------------
     # ctrl+d is dictation in the Claude desktop app and end-of-input in every

@@ -153,7 +153,7 @@ yourself before the tool will behave.
 
 | The thing | How to find yours | What breaks if it is wrong |
 |---|---|---|
-| **Your app's dictation shortcut** | The app's own settings, or its keyboard shortcut list. Nothing in this repository can tell you, because the shortcut belongs to the app and moves between releases. Once you have a candidate, confirm it against the real window with `--test-key --key ctrl+shift+v`. | The key still gets pressed. It just fires whatever the app really has bound there, in a window you are looking at. That is the failure the whole routing table exists to prevent, so never enable a profile on a shortcut nobody has confirmed. |
+| **Your app's dictation shortcut** | The app's own settings, or its keyboard shortcut list. Nothing in this repository can tell you, because the shortcut belongs to the app and moves between releases. Once you have a candidate, confirm it against the real window with `--test-key --key ctrl+shift+v`. | The key still gets pressed. It just fires whatever the app really has bound there, in a window you are looking at. That is the failure the whole routing table exists to prevent, so never enable a profile on a shortcut nobody has confirmed. The one key that ships armed without your confirmation is the catch-all's `ctrl+space`, for the reasons under *Every other app, through Windows itself*; confirm that one after the fact, and turn it off if it does nothing on your machine. |
 | **The process name of each app you want** | `--whoami`, then click that window during the countdown. It prints the process name, the window title, which profile claims the window, and what a snap there would send. | A profile naming an image that does not exist on your machine matches nothing, so every snap in that window is ignored and `snap.log` marks it `skipped`. Install method changes the name, so a Microsoft Store package and a direct download need not agree. |
 | **Your microphone** | `--list-devices`, then put that index in `device` in `config.json`. | The listener opens an input that cannot hear you and nothing in `snap.log` explains it beyond an absence of detections. |
 | **Your detection thresholds** | `--calibrate`, or tune by hand against `--dry-run`. The shipped `config.json` was tuned in one room, on one microphone, from one person's snap. | Too tight and real snaps are dropped silently, which reads as "it works sometimes". Too loose and a keystroke near the mic can send a message you never wrote. |
@@ -181,9 +181,10 @@ What is wired out of the box:
 | Codex | `chatgpt.exe` plus `^Codex$` | one snap | `ctrl+b` |
 | ChatGPT | `chatgpt.exe` plus `^ChatGPT$` | one snap | `ctrl+b` |
 | Antigravity | `antigravity.exe` | snap on, snap off, snap twice submits | `ctrl+m`, then `enter` |
-| Antigravity IDE | `antigravity ide.exe` | none | nothing, deliberately |
-| VS Code | `code.exe` | none | nothing, deliberately |
-| Anything else | none | none | ignored |
+| Antigravity IDE | `antigravity ide.exe` | snap on, snap off, snap twice submits | `ctrl+space` through Windows, then `enter` |
+| VS Code | `code.exe` | snap on, snap off, snap twice submits | `ctrl+space` through Windows, then `enter` |
+| Anything else | nothing claims it, so the catch-all does | snap on, snap off, snap twice submits | `ctrl+space` through Windows, then `enter` |
+| 17 named processes | terminals, the desktop shell, UAC and password prompts | none | nothing, ever |
 
 **Treat *Matched by* and *Sends* as this machine's answers, not yours.** The keys
 were the right ones for the app versions installed here on the day they were
@@ -192,17 +193,84 @@ image names are what those apps were called here, and an installer can change
 that too. Check the process name with `--whoami` and the key with `--test-key`
 before you rely on either.
 
-A window that matches nothing is ignored, and that narrowness is the safety
-mechanism rather than an oversight. Ctrl+D is the Claude app's dictation
-toggle, but it is also **end of input in every terminal**, and it is how the
-Claude Code CLI quits. Twice within 800 ms and the session is gone. The
-listener fires on a *sound*, and a sound has no idea what has focus. So the
-guard has to be a list of windows where the key means what we think it means.
+Antigravity IDE and VS Code sit in that table with no key of their own on
+purpose, and they still work; a profile that cannot press anything falls
+through to the catch-all rather than doing nothing.
+
+For a long time a window that matched nothing was simply ignored, and that
+narrowness *was* the safety mechanism. The catch-all trades it for a smaller and
+sharper one: a named list of windows the tool refuses to type into at all. The
+reason a guard has to exist has not changed. Ctrl+D is the Claude app's
+dictation toggle, but it is also **end of input in every terminal**, and it is
+how the Claude Code CLI quits. Twice within 800 ms and the session is gone. The
+listener fires on a *sound*, and a sound has no idea what has focus.
 
 An earlier version allowed terminals, back when the key was Alt+K and harmless.
 That would now turn a false positive into a lost session. `test_detector.py`
 asserts that no terminal matches any profile, and `--verify` checks the same
 thing against your live config.
+
+### Every other app, through Windows itself
+
+Wiring an app up means finding its dictation shortcut, and most apps do not
+have one. Windows does. It has its own dictation that works in any window that
+takes text, and it needs no per-app setup, so an app nobody has wired is not
+out of reach. Press the system key instead of an app key and the same gesture
+works everywhere.
+
+That is the `fallback` block in `config.json`, and it applies to any window no
+profile claimed:
+
+```json
+"fallback": {"name": "Windows voice typing", "mode": "dictation",
+             "activate": "ctrl+space", "send": "enter", "enabled": true}
+```
+
+Snap once to start, snap again to stop, snap twice to submit. The same three
+gestures, in Chrome, in Word, in Slack, in an IDE, in anything.
+
+**Check the key before you trust it.** It ships as `ctrl+space` because that is
+what worked on the machine this was written on. Windows' own documented
+voice-typing shortcut is `win+h`, and on some machines `ctrl+space` is bound to
+an input-method switch instead. Confirm yours with `--test-key` first. A wrong
+key here matters more than a wrong key anywhere else in this file, because this
+one reaches every app rather than one.
+
+An app that has a profile but no key of its own uses the catch-all too. That is
+why Antigravity IDE and VS Code work now: their own dictation shortcuts are
+missing or wrong, which is exactly the case the system-wide key covers.
+
+### The apps it refuses to touch
+
+Every other profile names the window it may type into. This one names nothing,
+so its safety is a list rather than a match, and the list exists because of the
+send. A double snap presses Enter, and Enter is not a harmless key everywhere:
+
+| Window | What Enter does there |
+|---|---|
+| any terminal | runs whatever is on the command line |
+| `explorer.exe` | opens the selected icon, and it is also the desktop and the taskbar, which is the foreground window whenever nothing else is |
+| `consent.exe` | the UAC prompt, where Enter is Yes |
+| `LogonUI.exe`, `CredentialUIBroker.exe` | the lock screen and credential dialogs, where keystrokes go into a password box |
+| `Taskmgr.exe` | End Task on whatever is selected |
+
+Seventeen processes are refused outright. A window whose process cannot be
+identified is refused as well, because a window that cannot be named cannot be
+vouched for. `--verify` checks the list rather than trusting it, and the test
+suite asserts every entry individually.
+
+Extend the list rather than cutting it down. An app wrongly left out gets no
+dictation and says so in the log. An app wrongly let in gets a keystroke nobody
+asked for.
+
+One more thing keeps it honest. Each unwired app resolves under its own name,
+`Windows voice typing [chrome.exe]`, and the focus re-check compares profile
+names. Start dictating in a browser, alt-tab to a text editor, and the two
+windows no longer carry the same name, so the stop is withheld instead of typed
+into the editor.
+
+To turn the whole thing off, set `"enabled": false` on the `fallback` block, or
+clear its `activate`. Either one silences every unwired app.
 
 ### Why the title matters as well as the process
 
@@ -422,10 +490,17 @@ python snap_to_dictate.py --stop
   `--device N`. Use `--list-devices` to see them.
 - **Elevation has to match.** Windows blocks synthetic input across integrity
   levels, in both directions. The Claude app runs unelevated, so the listener
-  must too. That is why the task is registered `-RunLevel Limited`.
-- **A snap while another window has focus does nothing.** It is still written to
-  `snap.log`, marked `skipped`, along with the process that had focus. That log
-  line is the first thing to read when a snap "did not work".
+  must too. That is why the task is registered `-RunLevel Limited`. Since the
+  catch-all types into whatever is in front, an elevated window is now
+  reachable at any moment, so a refused keystroke is logged as `refused` and
+  the listener carries on. It used to end the process instead, which is how
+  two sessions were lost on 23 August 2026.
+- **A snap in a refused window does nothing.** Terminals, the desktop shell, UAC
+  and password prompts are on the never-touch list, so a snap there is written
+  to `snap.log`, marked `skipped`, along with the process that had focus. That
+  log line is the first thing to read when a snap "did not work". Everywhere
+  else the catch-all takes it, so "nothing happened" more often means Windows
+  voice typing did not open than that the snap was missed.
 - **A rejected transient costs 12 ms of deafness, not 220.** `refractory_ms`
   applies only after an accepted snap. `reject_refractory_ms` covers rejections,
   so a snap that lands right after a cough or a keystroke is not swallowed.
@@ -467,14 +542,14 @@ python snap_to_dictate.py --stop
 
 ```
 mic ──► SnapDetector ──► focus guard ──► classify ──► SendInput ──► the app
-        (is it a snap?)   (is a wired     (start, stop   (ctrl+d, and   (record, then
-                           app in front?)  or send?)      then enter)    submit)
+        (is it a snap?)   (allowed to     (start, stop   (ctrl+d, and   (record, then
+                           type here?)     or send?)      then enter)    submit)
 ```
 
-The focus guard runs *before* classify rather than after. A snap that lands
-while an unwired app is in front has nothing to do with this program, and
-letting it reach the trigger gate would burn the cooldown, so the next snap, the
-real one, would be swallowed.
+The focus guard runs *before* classify rather than after. A snap that lands in a
+window this program refuses to touch has nothing to do with it, and letting it
+reach the trigger gate would burn the cooldown, so the next snap, the real one,
+would be swallowed.
 
 ### SnapDetector
 
