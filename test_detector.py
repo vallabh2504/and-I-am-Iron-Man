@@ -7,6 +7,7 @@ Two halves:
      to check the shipped config.json against ground truth.
 """
 import inspect
+import io
 import re
 import sys
 from pathlib import Path
@@ -671,6 +672,55 @@ check("...and releases the singleton it tests for",
       "CloseHandle" in _verify, True)
 check("--verify exits non-zero when something failed",
       "return 1 if failed else 0" in _verify, True)
+# A window title is the only text in this program that comes from outside it,
+# and one of them ended a listener that had run for hours. An app put a
+# zero-width space in its title, the log line carrying that title could not be
+# encoded to the pipe's cp1252, and UnicodeEncodeError came out of print() on
+# the normal per-snap path. Two layers now stand between a title and a dead
+# process, so both are asserted, and the title is the real one.
+_BAD_TITLE = "Claude" + chr(0x200B)
+
+_pipe = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+try:
+    _pipe.write(_BAD_TITLE)
+    _pipe.flush()
+    _still_crashes = False
+except UnicodeEncodeError:
+    _still_crashes = True
+check("the title that killed the listener still breaks a raw cp1252 stream",
+      _still_crashes, True)
+
+check("...but loggable() takes the character out",
+      chr(0x200B) in _s.loggable(_BAD_TITLE), False)
+check("...leaving the readable part of the title alone",
+      _s.loggable(_BAD_TITLE).startswith("Claude"), True)
+check("...and printable text is passed through untouched",
+      _s.loggable("Codex - Antigravity IDE"), "Codex - Antigravity IDE")
+
+_fixed = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+_fixed.reconfigure(encoding="utf-8", errors="replace")
+try:
+    _fixed.write(_BAD_TITLE)
+    _fixed.flush()
+    _survives = True
+except UnicodeEncodeError:
+    _survives = False
+check("...and a reconfigured stream survives even an unstripped title",
+      _survives, True)
+
+# The layers have to be wired in, not merely present. Matching must NOT be
+# sanitised: resolve_profile has to see what Windows actually reported, or a
+# pattern would match a window whose real title is something else.
+check("main() fixes the output encoding before anything prints",
+      "utf8_output()" in inspect.getsource(_s.main), True)
+check("...and does it without letting the attempt itself raise",
+      "except (AttributeError, ValueError, OSError)"
+      in inspect.getsource(_s.utf8_output), True)
+check("the listener logs titles through loggable()",
+      "loggable(title)" in inspect.getsource(_s.listen), True)
+check("...but resolves profiles against the raw title",
+      "resolve_profile(exe, title" in inspect.getsource(_s.listen), True)
+
 check("the terminal list covers the common shells",
       {"cmd.exe", "powershell.exe", "pwsh.exe",
        "windowsterminal.exe"} <= set(TERMINALS), True)

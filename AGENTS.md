@@ -88,6 +88,83 @@ python snap_to_dictate.py --stop
 
 ---
 
+## What you can finish alone, and what you cannot
+
+Somebody has been handed this repository and has handed it to you. Most of the
+setup you can complete without troubling them. The rest genuinely cannot be
+done without them, and the reason is always the same one: the step needs a
+person in the room, in front of a window, making a noise. Say which of the two
+you are at. Do not stall on a human step and do not pretend you performed it.
+
+| Step | Who does it | What you do |
+|---|---|---|
+| `pip install -r requirements.txt` | agent alone | Run it. Two wheels, no build step, nothing beyond the package index. |
+| `python snap_to_dictate.py --verify` | agent alone | Run it and branch on the exit code, not the text. `--json` gives you the same report parsed. A `WARN` for no listener running and no wired app open is expected on a fresh machine and is not yours to fix. |
+| `python test_detector.py` | agent alone | Run it before you change anything, so you know what the baseline was, and again before you call a change fine. |
+| Editing `config.json` | agent alone, within limits | The device index, the thresholds and the scaffolding of a new profile are yours to write. `"enabled": true` on a shortcut nobody has confirmed is not. See *Never guess a shortcut* below. |
+| Registering the logon scheduled task | agent alone, one condition | Run the PowerShell from *Autostart at logon* in README.md. It reads the repository path, the interpreter path, `$env:USERNAME` and `$env:COMPUTERNAME` from the environment, so it needs no editing, but it has to run from inside the repository **in the human's own interactive session** and register for that same user. `-RunLevel Limited` and `-LogonType Interactive` are load-bearing and both fail in ways that are hard to trace. |
+| Choosing the microphone | agent asks the human one thing | Run `--list-devices` yourself, show them the list, and ask which index is the microphone they actually talk into. You cannot hear the room. |
+| Finding an app's dictation shortcut | human | It is in that app's own settings or keyboard shortcut list. It is not in this repository and cannot be derived from it. Ask the human for the key by name. A shortcut you found anywhere other than their app is a guess. |
+| `python snap_to_dictate.py --whoami` | human | It counts down and then reads whichever window is focused at the end of the count. The human has to click the window they want identified. If you run it, it identifies your own terminal and tells you nothing. Ask them to run it and paste back the process, title and profile lines. |
+| `python snap_to_dictate.py --test-key --key <candidate>` | human | The target window has to be focused when the count ends, and somebody has to watch whether the app reacted. `SendInput` reporting success only means the keystroke left this process. Ask them what the app did, and treat "nothing happened" as a wrong key rather than a wrong tool. |
+| `python snap_to_dictate.py --calibrate` | human | All seven passes, and every one of them is a performance. They sit quiet, snap ten times from where they sit, snap ten times from across the room, talk for a minute without snapping, type and click and shift in the chair, snap ten pairs, then talk-snap-stop eight times. 237 seconds of recording and about five minutes of their time. Hand them CALIBRATION.md and wait. |
+| The `--dry-run` live check | human | Ninety seconds of talking and snapping, per *Live check* in CALIBRATION.md. Same reason. Nothing is sent during it, so it is the safe last step. |
+
+### The shortest path
+
+1. `pip install -r requirements.txt`
+2. `python snap_to_dictate.py --verify`. Fix every `FAIL`. If you cannot, stop
+   and report which one, because nothing below this line will work.
+3. `python test_detector.py`, to know the baseline passed before you touched
+   anything.
+4. Ask the human which apps they want to drive and what each one's dictation
+   shortcut is. This is the single question the whole setup turns on, and it is
+   the one thing you cannot look up.
+5. Ask them to run `--whoami` once per app, clicking that app's window during
+   the countdown, and to paste back what it printed.
+6. Write a profile per app into `config.json` using those process and title
+   values and the shortcut they gave you, with `"enabled": false`.
+7. Ask them to focus each window and run `--test-key --key <their key>`, and to
+   tell you whether the app reacted. Set `"enabled": true` only for the ones
+   that did.
+8. `python snap_to_dictate.py --verify` again. The waiting-profile `WARN`
+   should have gone for everything you enabled, and the terminal check should
+   still be `OK`.
+9. Ask whether they want it running at logon. If they do, register the
+   scheduled task from *Autostart at logon* in README.md.
+10. Leave calibration alone unless snaps are being missed or false ones are
+    getting through. If they are, hand them CALIBRATION.md and ask them to run
+    `--calibrate`.
+
+### Permissions
+
+All of that needs you to run shell commands, `pip`, `python` and PowerShell, and
+to write `config.json`. In Claude Code that is either a confirmation prompt for
+each command or a permission mode that stops prompting for each one. Prompting
+is slower and every command is read by a person before it runs. Not prompting is
+faster and gives that up, on a tool whose entire job is to synthesise keystrokes
+into other applications.
+
+**That trade is the human's to make, not yours.** Tell them which commands you
+need to run and let them choose how they want to approve them. Do not change
+permission settings yourself.
+
+### Never guess a shortcut
+
+Never invent a dictation shortcut and set `"enabled": true` on a profile the
+human has not confirmed. A plausible key is not a confirmed key, and a live
+config is not the place to find out which it was. A wrong key fired into the
+wrong window is exactly what invariant 1 exists to prevent, and enabling a
+profile is the act that arms it.
+
+`"enabled": false` with `"activate": null` is a legitimate, tested state. It
+means the app is wired up and waiting for somebody to find its shortcut.
+`profile_ready()` refuses to send for it and `--verify` reports it as a `WARN`
+rather than a `FAIL`, precisely so you can leave it there honestly instead of
+filling it in to make a warning go away.
+
+---
+
 ## Architecture
 
 Audio arrives in 256-sample blocks at 44.1 kHz, so **5.805 ms per block**. That
@@ -126,7 +203,7 @@ counting the wrong thing. The event is the unit.
 |---|---|
 | what counts as a snap | `SnapDetector` gates, `snap_to_dictate.py:236` |
 | single vs double, pairing windows | `TriggerGate`, `snap_to_dictate.py:507` |
-| which key goes to which app | `resolve_profile`, `snap_to_dictate.py:737` |
+| which key goes to which app | `resolve_profile`, `snap_to_dictate.py:766` |
 | the dictation on/off/submit flow | `listen()` and `resolve_pending` |
 | what calibration measures | `CAL_PASSES` and `derive()`, and CALIBRATION.md with it |
 | install checks | `cmd_verify`, `snap_to_dictate.py` |

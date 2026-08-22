@@ -12,6 +12,20 @@ Duplicate launches are deliberately not filtered here. The listener itself holds
 a named-event singleton, so a second copy exits before it opens the microphone.
 Letting a race happen and lose costs one short-lived process; a lock file checked
 here would instead have to be second-guessed for staleness every time.
+
+That tolerance is what lets the scheduled task double as a watchdog. The task
+carries two triggers: one at logon, and one that repeats every five minutes
+forever. The repeating one runs this launcher over and over against a listener
+that is usually already alive, which costs a Python startup and nothing else,
+and matters on the run where the listener is gone.
+
+It has been gone. A window put a zero-width space in its title, the log line
+carrying that title could not be encoded, and UnicodeEncodeError came out of
+print() on the per-snap path. That specific bug is fixed at its root, in
+utf8_output() and loggable(). The watchdog is for the next one: an unplugged
+microphone, a device claimed in exclusive mode, or a driver reset on resume can
+still end the listener, and without a repeating trigger it would stay ended
+until the next logon with nothing on screen to say so.
 """
 import subprocess
 import sys

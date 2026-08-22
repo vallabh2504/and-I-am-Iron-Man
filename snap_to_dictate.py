@@ -664,6 +664,35 @@ user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
 user32.GetWindowTextW.restype = ctypes.c_int
 
 
+def loggable(text):
+    """A window title with the characters that break a log line taken out.
+
+    Window titles are the one piece of text in this program that comes from
+    outside it. Any application can put anything in its own title bar, and one
+    of them put a zero-width space (U+200B) in there, which killed a listener
+    that had been running fine for hours:
+
+        UnicodeEncodeError: 'charmap' codec can't encode character '​'
+
+    Nothing was wrong with the audio or the detector. The listener wrote its
+    log through a pipe, Python picked the system codepage for it because a pipe
+    is not a console, and cp1252 has no such character. The traceback went to
+    the log and the process was gone, so every snap after that did nothing and
+    nothing on screen said why.
+
+    The encoding is fixed at the top of main(). This is the second layer, and
+    it is worth having on its own: invisible and control characters in a log
+    line make it lie about what it saw. A title that reads Claude here is a
+    title that might really be C​laude, and no amount of squinting at the
+    log would show it.
+
+    Applied only where a title is printed, never where one is matched.
+    resolve_profile has to see exactly what Windows reported, or a profile
+    would match a window whose real title is not what the pattern says.
+    """
+    return "".join(c if c.isprintable() else " " for c in text)
+
+
 def window_title(hwnd):
     """Title text of a window, or "" if it has none.
 
@@ -790,7 +819,7 @@ def send_key_if_focused(mod_vks, key_vk, prof, cfg, what):
     if now is not None and now["name"] == prof["name"]:
         send_key(mod_vks, key_vk)
         return True
-    where = "%s%s" % (exe, (" [%s]" % title) if title else "")
+    where = "%s%s" % (exe, (" [%s]" % loggable(title)) if title else "")
     print("[%s] dropped %s for %s; focus moved to %s"
           % (time.strftime("%H:%M:%S"), what, prof["name"], where))
     return False
@@ -1702,7 +1731,7 @@ def cmd_test_key(cfg, seconds=5, override=None):
         time.sleep(1)
     exe, title = foreground_window()
     prof = resolve_profile(exe, title, cfg)
-    where = "%s%s" % (exe, (" [%s]" % title) if title else "")
+    where = "%s%s" % (exe, (" [%s]" % loggable(title)) if title else "")
     if prof is None:
         print("\nFocused window is %s, which no profile claims." % where)
         print("Nothing sent. Run --whoami to see how to add it.")
@@ -2112,7 +2141,7 @@ def listen(cfg, dry_run, instance, watch, record=None):
             # so the next snap, the real one, would be swallowed.
             exe, title = foreground_window()
             prof = resolve_profile(exe, title, cfg)
-            where = "%s%s" % (exe, (" [%s]" % title) if title else "")
+            where = "%s%s" % (exe, (" [%s]" % loggable(title)) if title else "")
 
             if prof is None:
                 print("[%s] snap    %s  ignored, focus=%s" % (stamp, detail, where))
@@ -2502,7 +2531,42 @@ def cmd_verify(cfg, config_path, as_json=False):
     return 1 if failed else 0
 
 
+def utf8_output():
+    """Make stdout and stderr incapable of killing this process.
+
+    Under pythonw there is no console, so autostart.py hands the listener a
+    pipe into snap.log. Python then picks an encoding for stdout the way it
+    always does for a non-console stream, from the system locale, which on a
+    Windows install in most of the world is a legacy codepage rather than
+    UTF-8. Printing one character that codepage cannot represent raises
+    UnicodeEncodeError from inside print(), and print() is called on the
+    normal path for every snap.
+
+    That is exactly how a listener died here after several hours: some window
+    put a zero-width space in its title, the log line carrying that title could
+    not be encoded, and the traceback ended the process. From the outside the
+    tool simply stopped working, and it stayed stopped until the next logon,
+    because the scheduled task only fires then.
+
+    errors="replace" is the part that matters more than the encoding. UTF-8 can
+    encode anything, but this program also runs by hand in a real console whose
+    codepage is whatever the user has, and a logging call is never worth an
+    exception. An unprintable character becomes a substitution mark and the
+    listener keeps listening.
+
+    Older interpreters, and anything that has already replaced sys.stdout, are
+    left alone rather than forced. Failing to improve the stream is not a
+    reason to refuse to start.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
 def main():
+    utf8_output()
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--config", type=Path, default=CONFIG_PATH)
     ap.add_argument("--device", type=int, help="input device index")
