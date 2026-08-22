@@ -936,6 +936,8 @@ check("the stop-gesture count is what the document asks for",
 # checks are that list. The send is what makes it dangerous: a double snap
 # presses Enter, and Enter runs the command line in a shell, opens the selected
 # icon on the desktop, and answers Yes on a UAC prompt.
+check("explorer.exe is no longer refused by process alone",
+      "explorer.exe" in _s.NEVER_FALLBACK, False)
 for _exe in sorted(_s.NEVER_FALLBACK):
     check("the catch-all refuses %s" % _exe, route_all(_exe), None)
 
@@ -980,10 +982,55 @@ check("...and does not share it with the catch-all",
 # above stop meaning anything the moment focus moves.
 check("the focus-moved reset compares sessions, not names",
       "session_of(prof) != session_of(active)" in _src, True)
+
+# ...unless the app it belongs to says otherwise. Windows voice typing is cloud
+# speech recognition: the words arrive after the panel closes, and a person
+# waits to see them before deciding to send. Every send that failed in snap.log
+# on 2026-08-23 was snapped 1 to 2 seconds after the stop and read as "start
+# dictating again" instead, which reopened the panel rather than sending.
+_CATCH = dict(DEFAULTS["fallback"])
+check("the global send window is the tighter one",
+      _s.send_window_for(None, live), live["send_window_ms"])
+check("the catch-all gets a wider one, for the cloud round trip",
+      _s.send_window_for(_CATCH, live) > live["send_window_ms"], True)
+check("a named profile does not, because its transcript is already local",
+      _s.send_window_for(next(p for p in DEFAULTS["profiles"]
+                              if p["name"] == "Claude desktop"), live),
+      live["send_window_ms"])
+check("...so the same late snap does send in Windows voice typing",
+      classify(SETTLING, event(GOOD, 500), 1400.0, live, strict, start_gate,
+               _CATCH)[0], "send")
+check("...but not one later than even that window",
+      classify(SETTLING, event(GOOD, 700), 9000.0, live, strict, start_gate,
+               _CATCH)[0], None)
+check("...and the shape gate still applies inside the wider window",
+      classify(SETTLING, event(DULL, 500), 1400.0, live, strict, start_gate,
+               _CATCH)[0], None)
+
+# The expiry inside listen() has to read the same number, or the state would be
+# thrown away before the snap that classify would have accepted ever arrives.
+check("the settling expiry asks the profile too, not the global config",
+      "send_window_for(active, cfg)" in _src, True)
 check("every terminal is inside the refusal list",
       _s.TERMINALS <= _s.NEVER_FALLBACK, True)
-check("the desktop shell is refused, because Enter opens what is selected",
-      "explorer.exe" in _s.NEVER_FALLBACK, True)
+# explorer.exe used to be refused outright, which also refused the folder
+# windows the user actually wanted to dictate into. It is split by title now:
+# a folder window has a search box, the desktop and the switcher do not, and
+# Enter on the desktop opens whichever icon happens to be selected.
+check("the desktop is refused, because Enter opens what is selected",
+      route_all("explorer.exe", "Program Manager"), None)
+check("...and so is the alt-tab switcher",
+      route_all("explorer.exe", "Task Switching"), None)
+check("...and so is an explorer window with no title at all",
+      route_all("explorer.exe", ""), None)
+for _t in sorted(_s.SHELL_WINDOWS):
+    check("...and so is %r" % _t, route_all("explorer.exe", _t), None)
+    check("...whatever its case", route_all("explorer.exe", _t.title()), None)
+check("a folder window is allowed, so its search box can be dictated into",
+      (route_all("explorer.exe", "Downloads") or {}).get("activate"),
+      "ctrl+space")
+check("...and carries explorer.exe in its name like any other unwired app",
+      "explorer.exe" in route_all("explorer.exe", "Downloads")["name"], True)
 
 # An app that IS wired keeps its own key. The catch-all is a last resort, not
 # an override, or a snap in Claude would press the system key instead of ctrl+d.

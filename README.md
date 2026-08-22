@@ -249,12 +249,14 @@ send. A double snap presses Enter, and Enter is not a harmless key everywhere:
 | Window | What Enter does there |
 |---|---|
 | any terminal | runs whatever is on the command line |
-| `explorer.exe` | opens the selected icon, and it is also the desktop and the taskbar, which is the foreground window whenever nothing else is |
+| the Windows desktop, which is `explorer.exe` | opens whichever icon happens to be selected, and the desktop is the foreground window whenever nothing else is |
 | `consent.exe` | the UAC prompt, where Enter is Yes |
 | `LogonUI.exe`, `CredentialUIBroker.exe` | the lock screen and credential dialogs, where keystrokes go into a password box |
 | `Taskmgr.exe` | End Task on whatever is selected |
 
-Seventeen processes are refused outright. A window whose process cannot be
+Sixteen processes are refused outright, and `explorer.exe` is refused by title
+rather than by process, for the reason under *Explorer is four windows wearing
+one name*. A window whose process cannot be
 identified is refused as well, because a window that cannot be named cannot be
 vouched for, and "cannot be named" covers more than an empty string. When there
 is no foreground window at all, when the session is locked, or when the window
@@ -268,12 +270,11 @@ dictation and says so in the log. An app wrongly let in gets a keystroke nobody
 asked for.
 
 One more thing keeps it honest. Each unwired app resolves under its own name,
-`Windows voice typing [chrome.exe]`, and the focus re-check compares profile
-names. Start dictating in a browser, alt-tab to a text editor, and the two
-windows no longer carry the same name, so the stop is withheld instead of typed
-into the editor.
+`Windows voice typing [chrome.exe]`, so the log tells you which window a snap
+came from rather than lumping every unwired app into one line.
 
-Those names share one **session**, though, and that distinction matters. Windows
+Those names share one **session**, though, and the focus re-check compares the
+session rather than the name. That distinction matters. Windows
 voice typing is a single panel for the whole desktop, not one dictation per app,
 so alt-tabbing does not start a new one. If the tool treated the move as a fresh
 dictation it would press `ctrl+space` believing it was opening the panel, when
@@ -284,6 +285,85 @@ dictation". They are not the same question.
 
 To turn the whole thing off, set `"enabled": false` on the `fallback` block, or
 clear its `activate`. Either one silences every unwired app.
+
+### Explorer is four windows wearing one name
+
+`explorer.exe` is the file manager, and it is also the desktop, the alt-tab
+switcher and the taskbar. One image name, four windows, and only the first of
+them has anywhere to put text. A folder window has a search box and a title
+naming the folder. The desktop has no text field at all and is the foreground
+window whenever nothing else is, so an Enter there opens whichever icon happens
+to be selected.
+
+The title separates them cleanly, because Windows names the three that are not
+folders and those names do not change with the folder you are looking at:
+
+| Title | What the catch-all does |
+|---|---|
+| `Downloads`, `Documents`, any folder name | allowed, and `ctrl+space` reaches the search box |
+| `Program Manager` | the desktop, refused |
+| `Task Switching` | alt-tab, refused |
+| `Start`, `Search` | refused |
+| `Windows Shell Experience Host`, `Windows Input Experience` | refused |
+| empty | refused, because a window with no title cannot be told apart from those |
+
+That list is `SHELL_WINDOWS` in the source. `--verify` walks every entry of it
+against your live config rather than trusting that the code still matches this
+table.
+
+### What Windows voice typing actually is
+
+The catch-all leans on one Microsoft feature, so it inherits that feature's
+behaviour, limits and all. What is worth knowing before you rely on it:
+
+- **It is cloud speech recognition.** The audio goes to Microsoft's servers and
+  the words come back. No internet, no dictation, and there is always a lag
+  between stopping and the text appearing.
+- **`win+h` is the documented shortcut.** `ctrl+space` ships here because that
+  is what worked on the machine this was written on. It is not a Windows
+  default, so confirm it with `--test-key`, and change it to `win+h` if yours
+  does nothing.
+- **It pauses itself after roughly five to ten seconds of silence**, and
+  Microsoft does not expose a setting for that. It also stops when the internet
+  drops, when you click into another window, and when you start typing on the
+  keyboard.
+- **It is one panel for the whole desktop**, not one dictation per app. It types
+  into whatever has focus when the words arrive. That is the reason every
+  unwired window shares one session here.
+- **It understands spoken commands**, "Press Enter" among them, along with
+  "Stop listening", "Delete that", "Select that" and "Undo that". Dictation
+  commands are US English only. "Press Enter" does the same job as the double
+  snap, out loud, and it works when your hands are nowhere near the machine.
+- **Auto-punctuation and microphone choice** live behind the gear icon on the
+  panel, not in Settings.
+- **Voice Access is a different feature.** `win+h` dictates. Voice Access
+  controls the whole PC and works offline. If hands-free is the goal rather
+  than dictation specifically, that is the one to go and read about.
+
+### Why the catch-all gets a wider send window
+
+The cloud lag is what broke the send, and the log says so in numbers. Every
+double snap that landed was snapped *during* the stop gesture, at 88, 98 and
+561 ms. Every one that did not was snapped one to two seconds after the
+`dictation OFF` line, because the person was waiting to watch the words appear
+before submitting them. Those fell outside the 750 ms window, were read as
+"start dictating again", and reopened the panel instead of sending. The gate was
+working exactly as written. The number was wrong for this one app.
+
+So the window is per profile now. `send_window_ms` on a profile overrides the
+global value for that profile only:
+
+```json
+"fallback": {"name": "Windows voice typing", "mode": "dictation",
+             "activate": "ctrl+space", "send": "enter", "enabled": true,
+             "send_window_ms": 2500.0}
+```
+
+2500 ms is the cloud round trip plus the beat a person spends reading the
+result. An app whose dictation is local, Claude desktop being the one measured
+here, has no such lag and keeps the tighter global 750 ms, where a wider window
+would start reading casual pairs of snaps as sends. One number could not fit
+both, which is why there are now two.
 
 ### Why the title matters as well as the process
 
@@ -533,7 +613,10 @@ python snap_to_dictate.py --stop
   989 ms.
 - **The send snap has to be quick.** Not "snap, then snap". One gesture, both
   snaps inside `send_window_ms`, which the shipped `config.json` sets to 750 ms.
-  The built-in default is 1000 ms and applies only if you delete the key.
+  The built-in default is 1000 ms and applies only if you delete the key, and a
+  profile may carry its own value to override the global one. The catch-all
+  does, at 2500 ms, for the reason under *What Windows voice typing actually
+  is*.
   Measured double snaps here landed at 76 to 989 ms, and calibration sets the
   window from the 95th percentile rather than the slowest one, so the rare very
   slow pair falls outside it on purpose. The same person snapping twice
@@ -659,7 +742,8 @@ config rather than trusting either pair of numbers here.
 
 `SETTLING` is the only state this program invented. Dictation is already off.
 What is being decided is whether to submit. It lasts `send_window_ms`, which is
-750 ms in the shipped `config.json`, and then lapses back to `IDLE` on its own,
+750 ms in the shipped `config.json` and 2500 ms under the catch-all, and then
+lapses back to `IDLE` on its own,
 so a snap a few seconds after a stop reads as "start again" rather than "send".
 
 The app shows and sounds dictation starting and stopping, so those two states
@@ -838,7 +922,7 @@ Send-side keys, the gate that decides whether a message actually goes out:
 
 | Key | Effect |
 |---|---|
-| `send_window_ms` | how long after a stop a second snap still means "send" |
+| `send_window_ms` | how long after a stop a second snap still means "send". A profile may carry its own and override this one |
 | `pair_refractory_ms` | deaf time after a stop, while a confirming snap may follow |
 | `strict_tail_hf_ratio_min` | how bright that confirming snap must still be as it dies |
 | `send_key` | what is pressed to submit |

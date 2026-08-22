@@ -229,6 +229,9 @@ DEFAULTS = {
     "fallback": {
         "name": "Windows voice typing", "mode": "dictation",
         "activate": "ctrl+space", "send": "enter", "enabled": True,
+        # Cloud speech recognition, so the words land after the panel closes and
+        # a person waits to see them. See send_window_for.
+        "send_window_ms": 2500.0,
     },
 
     # --- lifecycle, for --follow ---
@@ -799,9 +802,7 @@ TERMINALS = frozenset({
 # Enter, and Enter is not a neutral key everywhere:
 #
 #   a terminal            runs whatever is on the command line
-#   explorer.exe          opens the selected icon; it is also the desktop and
-#                         the taskbar, which is the foreground window whenever
-#                         nothing else is
+#   explorer.exe          handled separately, by title - see SHELL_WINDOWS
 #   consent.exe           the UAC prompt. Enter is Yes.
 #   LogonUI.exe,          the lock screen and the credential dialogs, where
 #   CredentialUIBroker    keystrokes go into a password box
@@ -811,8 +812,22 @@ TERMINALS = frozenset({
 # dictation, which the log says plainly; an app wrongly let in gets a keystroke
 # nobody asked for.
 NEVER_FALLBACK = TERMINALS | frozenset({
-    "explorer.exe", "consent.exe", "logonui.exe", "credentialuibroker.exe",
+    "consent.exe", "logonui.exe", "credentialuibroker.exe",
     "taskmgr.exe", "lsass.exe", "winlogon.exe",
+})
+
+# explorer.exe is four different things wearing one image name, and only one of
+# them can be typed into. A folder window has a search box and a title naming
+# the folder. The desktop, the alt-tab switcher and the taskbar have no text
+# field at all, and the desktop is the foreground window whenever nothing else
+# is - so Enter there opens whichever icon happens to be selected.
+#
+# Windows names those three, and the names do not change with the folder the
+# user is in, so the title separates them cleanly. A folder window is allowed;
+# anything on this list, or a window with no title, is not.
+SHELL_WINDOWS = frozenset({
+    "program manager", "task switching", "start", "search",
+    "windows shell experience host", "windows input experience",
 })
 
 
@@ -849,7 +864,7 @@ def resolve_profile(exe, title, cfg):
         if not profile_ready(prof):
             break
         return prof
-    return fallback_profile(exe, cfg)
+    return fallback_profile(exe, title, cfg)
 
 
 def is_named_window(exe):
@@ -899,7 +914,7 @@ def session_of(prof):
     return prof.get("session") or prof["name"]
 
 
-def fallback_profile(exe, cfg):
+def fallback_profile(exe, title, cfg):
     """The catch-all for a window no profile claimed, or None to leave it alone.
 
     Three things must be true before an unwired window is sent anything. The
@@ -928,6 +943,9 @@ def fallback_profile(exe, cfg):
     if not prof or not prof.get("enabled") or not prof.get("activate"):
         return None
     if not is_named_window(exe) or exe in NEVER_FALLBACK:
+        return None
+    if exe == "explorer.exe" and (
+            not title or title.strip().lower() in SHELL_WINDOWS):
         return None
     return dict(prof, process=exe, name="%s [%s]" % (prof["name"], exe),
                 session=prof["name"])
@@ -1981,7 +1999,31 @@ def strict_profile(cfg):
     return out
 
 
-def classify(state, ev, held_ms, cfg, strict, start_gate):
+def send_window_for(prof, cfg):
+    """How long after a stop a second snap still means "send", for this app.
+
+    One global number cannot fit both cases, and measurement says so.
+
+    An app that transcribes locally has the text on screen the moment dictation
+    stops, so the person snapping already knows what they are about to send and
+    750 ms is generous. Windows voice typing is cloud speech recognition: the
+    audio goes to a server and the words come back a beat after the panel
+    closes. A person waits to see them land before deciding to send, which is
+    the correct thing to do and also slower than 750 ms.
+
+    snap.log on 2026-08-23 has both halves. Every send that landed was snapped
+    inside the hold, at 88, 98 and 561 ms. Every one that did not was snapped 1
+    to 2 seconds after the stop, fell outside the global window, and was read as
+    "start dictating again" instead - so the panel reopened rather than the
+    message going out. That is the reported bug, and it is a units problem, not
+    a gate problem.
+
+    Set send_window_ms on a profile to override the global value for that app.
+    """
+    return (prof or {}).get("send_window_ms") or cfg["send_window_ms"]
+
+
+def classify(state, ev, held_ms, cfg, strict, start_gate, prof=None):
     """Decide what a confirmed snap means right now.
 
     Returns (action, note): action is "start", "stop", "send" or None, and note
@@ -2016,9 +2058,10 @@ def classify(state, ev, held_ms, cfg, strict, start_gate):
         return "stop", ""
 
     # SETTLING: dictation is already off and this snap decides whether to send.
-    if held_ms > cfg["send_window_ms"]:
+    window = send_window_for(prof, cfg)
+    if held_ms > window:
         return None, "%.0f ms after the stop; send window is %.0f" % (
-            held_ms, cfg["send_window_ms"])
+            held_ms, window)
     if not strict.accepts(ev["peak_db"], ev["tail_hf"], ev["decay_ms"]):
         return None, "too dull to confirm a send (tail %.2f < %.2f); ignored" % (
             ev["tail_hf"], cfg["strict_tail_hf_ratio_min"])
@@ -2312,7 +2355,7 @@ def listen(cfg, dry_run, instance, watch, record=None):
 
             # The send window closes on its own, so that a snap a few seconds
             # after a stop reads as "start again" rather than "send".
-            if state == SETTLING and held_ms > cfg["send_window_ms"]:
+            if state == SETTLING and held_ms > send_window_for(active, cfg):
                 state, since = IDLE, now
                 held_ms = 0.0
             # Nothing tells us when the app stops recording on its own, so a
@@ -2389,7 +2432,8 @@ def listen(cfg, dry_run, instance, watch, record=None):
             # to stop and nothing to submit. Judge the snap exactly as a start
             # is judged, press the key, and stay idle.
             if prof.get("mode") == "oneshot":
-                action, note = classify(IDLE, ev, 0.0, cfg, strict, start_gate)
+                action, note = classify(IDLE, ev, 0.0, cfg, strict,
+                                        start_gate, prof)
                 if action is None:
                     print("[%s] snap    %s  %s" % (stamp, detail, note))
                     continue
@@ -2405,7 +2449,8 @@ def listen(cfg, dry_run, instance, watch, record=None):
                 start_gate.reset()
                 continue
 
-            action, note = classify(state, ev, held_ms, cfg, strict, start_gate)
+            action, note = classify(state, ev, held_ms, cfg, strict,
+                                    start_gate, prof)
             if action is None:
                 print("[%s] snap    %s  %s" % (stamp, detail, note))
                 continue
@@ -2439,7 +2484,8 @@ def listen(cfg, dry_run, instance, watch, record=None):
                     continue
                 print("[%s] TRIGGER %s  -> %s  dictation OFF (snap again "
                       "within %.0f ms to send)"
-                      % (stamp, detail, prof["activate"], cfg["send_window_ms"]))
+                      % (stamp, detail, prof["activate"],
+                         send_window_for(prof, cfg)))
                 det.expect_pair()
             else:
                 # The activate key has already been pressed; the transcript is
@@ -2706,10 +2752,21 @@ def cmd_verify(cfg, config_path, as_json=False):
         # The list is the only thing standing between a double snap and an
         # Enter pressed into a shell, so it is checked rather than trusted.
         leaked = sorted(e for e in NEVER_FALLBACK
-                        if (fallback_profile(e, cfg) is not None))
+                        if (fallback_profile(e, "a window", cfg) is not None))
         note("OK" if not leaked else "FAIL", "the refusal list holds",
              "all %d refused" % len(NEVER_FALLBACK) if not leaked
              else "REACHES " + ", ".join(leaked))
+        # explorer.exe is allowed by process and refused by title, so the check
+        # that matters for it is a different one. A folder window can be typed
+        # into; the desktop, the switcher and the taskbar cannot.
+        shell = sorted(t for t in list(SHELL_WINDOWS) + [""]
+                       if fallback_profile("explorer.exe", t, cfg) is not None)
+        folder = fallback_profile("explorer.exe", "Downloads", cfg)
+        note("OK" if not shell and folder else "FAIL",
+             "explorer.exe is split by title",
+             "folder windows yes, %d shell windows no" % len(SHELL_WINDOWS)
+             if not shell and folder
+             else "REACHES " + ", ".join(repr(t) for t in shell))
 
     if waiting:
         note("OK" if on else "WARN", "profiles waiting to be configured",

@@ -106,6 +106,7 @@
     "mode": "dictation",
     "activate": "ctrl+space",
     "send": "enter",
-    "enabled": true
+    "enabled": true,
+    "send_window_ms": 2500.0
   }
 }

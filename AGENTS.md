@@ -204,14 +204,14 @@ two multiples of 5.805 behaves exactly like the lower one.
 microphone
     │  256-sample blocks
     ▼
-SnapDetector.push()                  snap_to_dictate.py:258
+SnapDetector.push()                  snap_to_dictate.py:261
     │  per-block rFFT, high band 1500-16000 Hz vs an EMA noise floor
     │  ONSET gates  ─► VERIFY gates ─► one event with five features
     ▼
 event {peak_db, onset_hf, tail_hf, decay_ms, attack_ms, crest}
     │
     ▼
-TriggerGate.offer()                  snap_to_dictate.py:529
+TriggerGate.offer()                  snap_to_dictate.py:532
     │  refractory, single-vs-double pairing, the send window
     ▼
 listen() state machine               IDLE / RECORDING / SETTLING
@@ -229,12 +229,13 @@ counting the wrong thing. The event is the unit.
 
 | You want to change | Go to |
 |---|---|
-| what counts as a snap | `SnapDetector` gates, `snap_to_dictate.py:258` |
-| single vs double, pairing windows | `TriggerGate`, `snap_to_dictate.py:529` |
-| which key goes to which app | `resolve_profile`, `snap_to_dictate.py:823` |
-| what an app with no profile gets | `fallback_profile`, `snap_to_dictate.py:902` |
-| which windows are never typed into | `is_named_window` and `NEVER_FALLBACK`, `snap_to_dictate.py:855` |
-| which dictation a snap belongs to | `session_of`, `snap_to_dictate.py:880` |
+| what counts as a snap | `SnapDetector` gates, `snap_to_dictate.py:261` |
+| single vs double, pairing windows | `TriggerGate`, `snap_to_dictate.py:532` |
+| which key goes to which app | `resolve_profile`, `snap_to_dictate.py:838` |
+| what an app with no profile gets | `fallback_profile`, `snap_to_dictate.py:917` |
+| which windows are never typed into | `is_named_window` and `NEVER_FALLBACK`, `snap_to_dictate.py:870` |
+| which dictation a snap belongs to | `session_of`, `snap_to_dictate.py:895` |
+| how long a send stays possible, per app | `send_window_for`, `snap_to_dictate.py:2002` |
 | the dictation on/off/submit flow | `listen()` and `resolve_pending` |
 | what calibration measures | `CAL_PASSES` and `derive()`, and CALIBRATION.md with it |
 | install checks | `cmd_verify`, `snap_to_dictate.py` |
@@ -290,7 +291,7 @@ instead, and `--verify` says so.
 
 ### The catch-all
 
-`fallback_profile` (`snap_to_dictate.py:902`) builds a profile on the spot for
+`fallback_profile` (`snap_to_dictate.py:917`) builds a profile on the spot for
 any window that no entry in `profiles` claimed. It ships enabled, so an app
 nobody wired up behaves like one that was, using Windows' own voice typing.
 
@@ -300,20 +301,21 @@ nobody wired up behaves like one that was, using Windows' own voice typing.
   "mode": "dictation",
   "activate": "ctrl+space",
   "send": "enter",
-  "enabled": true
+  "enabled": true,
+  "send_window_ms": 2500.0
 }
 ```
 
 The fields mean what they mean in a profile. There is no `process` or `title`,
-because not matching is the point. Three things about it are load-bearing rather
-than cosmetic, and each has tests.
+because not matching is the point. Everything below is load-bearing rather than
+cosmetic, and each part has tests.
 
-**It refuses 17 processes and every window it cannot identify.**
-`NEVER_FALLBACK` is the `TERMINALS` list plus seven more: `explorer.exe`,
-`consent.exe`, `logonui.exe`, `credentialuibroker.exe`, `taskmgr.exe`,
-`lsass.exe`, `winlogon.exe`. Terminals are there for invariant 1. The rest are
-there because `enter` in those windows opens the selected icon, clicks Yes on a
-UAC prompt, submits a password box or ends a task. `fallback_profile` also
+**It refuses 16 processes and every window it cannot identify.**
+`NEVER_FALLBACK` is the `TERMINALS` list plus six more: `consent.exe`,
+`logonui.exe`, `credentialuibroker.exe`, `taskmgr.exe`, `lsass.exe`,
+`winlogon.exe`. Terminals are there for invariant 1. The rest are there because
+`enter` in those windows clicks Yes on a UAC prompt, submits a password box or
+ends a task. `fallback_profile` also
 refuses any window it cannot name, and that is wider than an empty string:
 `foreground_window` reports its three failures as descriptions rather than
 `None`, so the log can say which failure it was, and `<no foreground window>`,
@@ -326,12 +328,27 @@ error 5 crashes below. `--verify` re-derives the whole
 refusal by calling `fallback_profile` on every name in the list, so it checks
 the refusal instead of trusting it. **Add to this list. Do not cut from it.**
 
+**`explorer.exe` is refused by title, not by process.** It used to sit on
+`NEVER_FALLBACK`, and that cost the user the file manager, which is the one
+place where a search box makes the gesture obviously worth having. One image
+name covers four windows: a folder window, the desktop, the alt-tab switcher and
+the taskbar. Only the folder window can be typed into, and only the desktop is
+dangerous, because it is the foreground window whenever nothing else is and
+`enter` there opens whichever icon is selected. Windows names the three that are
+not folders, and those names do not move with the folder the user is in, so the
+title separates them cleanly. `SHELL_WINDOWS` holds `program manager`, `task
+switching`, `start`, `search`, `windows shell experience host` and `windows
+input experience`; `fallback_profile` matches the title lowercased and stripped,
+and refuses an empty title as well, because a window with no title cannot be
+told apart from those. `--verify` and the test suite both walk the whole set. If
+you find another shell window, add it here rather than putting the process back
+on `NEVER_FALLBACK`.
+
 **Each window gets its own profile name**, `Windows voice typing [chrome.exe]`.
-That is the safety property, not a display detail. `send_key_if_focused`
-re-checks focus by comparing profile **names**, so a gesture begun in Chrome and
-finished after an alt-tab to Notepad is dropped rather than completed in the
-wrong app. One shared name across every unwired app would have removed that
-protection silently, because everything would have compared equal.
+`send_key_if_focused` re-checks focus by comparing profile **names**, and that
+is what stops a gesture begun in Chrome from being finished in Notepad after an
+alt-tab. Names are what the log prints too, so a line says which window its snap
+came from rather than lumping every unwired app together.
 
 **Every unwired window shares one session.** `session_of` returns the profile
 name for a named app and the shared `fallback` name for the catch-all, and the
@@ -360,6 +377,20 @@ and returns False; every send inside `listen` goes through it or through
 paths. Callers treat False as "the app was not touched" and leave state where
 it was, so a refused start does not put the loop into `RECORDING` waiting to
 stop a dictation that never began.
+
+**Its send window is its own, and wider.** A profile may carry its own
+`send_window_ms`; `send_window_for` (`snap_to_dictate.py:2002`) returns that
+when it is set and the global value otherwise, and `classify` now takes the
+profile so `SETTLING` can ask. The catch-all sets 2500 ms against a global 750 ms, because
+Windows voice typing is cloud recognition: the audio goes to Microsoft, the
+words come back a beat later, and a person waits to watch them land before
+deciding to submit. The log holds both halves. Every send that landed was
+snapped inside the stop gesture, at 88, 98 and 561 ms; every send that did not
+was snapped one to two seconds after `dictation OFF`, fell outside 750 ms, and
+was read as "start dictating again", which pressed `ctrl+space` and reopened the
+panel instead. Nothing was wrong with the gate. One global number could not fit
+a local dictation and a cloud one at once. Do not widen the global value to fix
+one app; give that app its own.
 
 Set `"enabled": false` on `fallback`, or its `activate` to `null`, and every
 window without a profile of its own goes back to being ignored.
@@ -428,7 +459,9 @@ python snap_to_dictate.py --derive calibration/2026-08-22-0436.wav
 ```
 
 Calibration derives **levels and timings only**, meaning `abs_floor_db`,
-`speech_over_floor_db`, the pairing window, and `send_window_ms`. It
+`speech_over_floor_db`, the pairing window, and the global `send_window_ms`
+(never a profile's override, which is a property of that app rather than of the
+room). It
 deliberately leaves the shape gates (`hf_ratio_min`, `tail_hf_ratio_min`, the
 decay bounds) and `pair_refractory_ms` alone. Those describe the physics of a
 snap and the mechanics of the detector, not a property of a room, and fitting
