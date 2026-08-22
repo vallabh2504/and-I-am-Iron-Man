@@ -940,6 +940,46 @@ for _exe in sorted(_s.NEVER_FALLBACK):
     check("the catch-all refuses %s" % _exe, route_all(_exe), None)
 
 check("a window with no identifiable process gets nothing", route_all(""), None)
+
+# foreground_window() names its three failures instead of returning None, so
+# that a skipped snap says in the log which failure it was. Those strings are
+# descriptions, not image names, and the catch-all was handed them: a snap
+# while nothing was in front pressed the system dictation key into whatever
+# Windows routed it to. Pulled out of the source rather than retyped, so a
+# fourth diagnostic added later is covered the day it is added.
+_fg = _src[_src.index("def foreground_window"):]
+_fg = _fg[:_fg.index(NL_ + "def ", 10)]
+_DIAGS = re.findall(r'return "(<[^"]*)"', _fg)
+check("foreground_window still reports its failures as <...> strings",
+      len(_DIAGS), 3)
+for _d in _DIAGS:
+    _name = _d.replace("%d", "1234")
+    check("the catch-all refuses %s" % _name, route_all(_name), None)
+    check("...and is_named_window says why", _s.is_named_window(_name), False)
+check("a real image name is still a name", _s.is_named_window("chrome.exe"),
+      True)
+
+# Windows voice typing is one panel for the whole desktop, not one dictation
+# per app. Every unwired window therefore gets its own NAME, so a delayed
+# keystroke cannot migrate between apps, but one shared SESSION, so alt-tabbing
+# does not read as a fresh dictation and press the key a second time - which
+# would close the panel while the log claimed it had opened one.
+check("two unwired apps share one dictation session",
+      _s.session_of(route_all("chrome.exe"))
+      == _s.session_of(route_all("notepad.exe")), True)
+check("...while still carrying different names",
+      route_all("chrome.exe")["name"] == route_all("notepad.exe")["name"],
+      False)
+check("a wired app is its own session",
+      _s.session_of(route_all("claude.exe", "Claude")), "Claude desktop")
+check("...and does not share it with the catch-all",
+      _s.session_of(route_all("claude.exe", "Claude"))
+      == _s.session_of(route_all("chrome.exe")), False)
+
+# The state machine has to ask session_of, not the profile name, or the two
+# above stop meaning anything the moment focus moves.
+check("the focus-moved reset compares sessions, not names",
+      "session_of(prof) != session_of(active)" in _src, True)
 check("every terminal is inside the refusal list",
       _s.TERMINALS <= _s.NEVER_FALLBACK, True)
 check("the desktop shell is refused, because Enter opens what is selected",

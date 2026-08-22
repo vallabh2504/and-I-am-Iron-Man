@@ -852,14 +852,62 @@ def resolve_profile(exe, title, cfg):
     return fallback_profile(exe, cfg)
 
 
+def is_named_window(exe):
+    """True when exe is a real image name rather than a diagnostic string.
+
+    foreground_window() reports its three failures as text rather than None, so
+    that a skipped snap says in the log which failure it was: no foreground
+    window at all (the session is locked, or the desktop is between windows), a
+    handle Windows refused (the window belongs to an elevated process), or a
+    name it could not read. Those strings describe a window. They do not name
+    one.
+
+    Until the catch-all existed they were harmless, because no profile names a
+    process called "<no foreground window>", so resolve_profile returned None
+    and the snap was ignored. The catch-all matches whatever it is handed, and
+    it was handed these, so a snap while nothing was in front pressed the
+    system dictation key into whatever Windows then routed it to. That is the
+    bug behind "the mic turned on and no window was active", and behind the
+    SendInput error 5 crashes too: the elevated-window diagnostic fell through
+    here and UIPI refused the keystroke on the way out.
+
+    The angle brackets are the contract rather than an accident. Win32 forbids
+    < and > in a filename, so no real image name can contain one.
+    """
+    return bool(exe) and "<" not in exe
+
+
+def session_of(prof):
+    """Which dictation this profile drives, as opposed to which window it names.
+
+    Almost always the same thing, because an app's own dictation belongs to that
+    app. Windows voice typing is the exception: it is one floating panel for the
+    whole desktop rather than one per application, and it types into whatever
+    has focus. So the catch-all gives every unwired window its own profile NAME,
+    because send_key_if_focused compares names to stop a delayed keystroke
+    migrating between apps, while all of those names share one SESSION, because
+    they all drive the single panel.
+
+    Confusing the two is not cosmetic. If alt-tabbing from a browser to a chat
+    app reads as a different dictation, the next snap presses the system key
+    believing it starts one, when what it actually does is close the panel that
+    was already open. Every reading after that is inverted: the log says ON
+    while the microphone is off, and the next snap turns the microphone on
+    while the log says OFF. snap.log caught exactly that at 00:19:05 on
+    2026-08-23, one line after a focus-moved notice.
+    """
+    return prof.get("session") or prof["name"]
+
+
 def fallback_profile(exe, cfg):
     """The catch-all for a window no profile claimed, or None to leave it alone.
 
     Three things must be true before an unwired window is sent anything. The
-    fallback has to be configured and enabled. The window has to have a process
-    name at all, because a window that cannot be identified cannot be vouched
-    for. And that process must not be on NEVER_FALLBACK, where Enter does
-    something no snap should be able to do.
+    fallback has to be configured and enabled. The window has to have a real
+    image name rather than one of foreground_window's diagnostics, because a
+    window that cannot be identified cannot be vouched for; see
+    is_named_window. And that process must not be on NEVER_FALLBACK, where
+    Enter does something no snap should be able to do.
 
     The name carries the process, and that is load-bearing rather than
     cosmetic. send_key_if_focused re-checks focus by comparing profile NAMES,
@@ -868,6 +916,10 @@ def fallback_profile(exe, cfg):
     resolve to different names, so the stop is withheld instead of typed into
     the editor. A single shared name would have let it through.
 
+    The session is the opposite half of that. Every unwired window shares one,
+    because Windows voice typing is a single panel for the whole desktop rather
+    than one dictation per app. See session_of.
+
     Returned as an ordinary profile so nothing downstream needs to know it is
     special - profile_ready, the focus re-check and the state machine all treat
     it exactly like a named one.
@@ -875,9 +927,10 @@ def fallback_profile(exe, cfg):
     prof = cfg.get("fallback")
     if not prof or not prof.get("enabled") or not prof.get("activate"):
         return None
-    if not exe or exe in NEVER_FALLBACK:
+    if not is_named_window(exe) or exe in NEVER_FALLBACK:
         return None
-    return dict(prof, process=exe, name="%s [%s]" % (prof["name"], exe))
+    return dict(prof, process=exe, name="%s [%s]" % (prof["name"], exe),
+                session=prof["name"])
 
 
 def profile_ready(prof):
@@ -2321,7 +2374,8 @@ def listen(cfg, dry_run, instance, watch, record=None):
             # from here, and carrying its state over would make the next snap
             # mean "stop" in a window that never started. Drop to idle and let
             # this snap be read fresh under the profile actually in front.
-            if active is not None and prof["name"] != active["name"] \
+            if active is not None \
+                    and session_of(prof) != session_of(active) \
                     and state != IDLE:
                 print("[%s] focus   moved %s -> %s; dropping the held %s state"
                       % (stamp, active["name"], prof["name"], state))

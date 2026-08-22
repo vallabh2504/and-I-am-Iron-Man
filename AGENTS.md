@@ -232,7 +232,9 @@ counting the wrong thing. The event is the unit.
 | what counts as a snap | `SnapDetector` gates, `snap_to_dictate.py:258` |
 | single vs double, pairing windows | `TriggerGate`, `snap_to_dictate.py:529` |
 | which key goes to which app | `resolve_profile`, `snap_to_dictate.py:823` |
-| what an app with no profile gets | `fallback_profile`, `snap_to_dictate.py:855` |
+| what an app with no profile gets | `fallback_profile`, `snap_to_dictate.py:902` |
+| which windows are never typed into | `is_named_window` and `NEVER_FALLBACK`, `snap_to_dictate.py:855` |
+| which dictation a snap belongs to | `session_of`, `snap_to_dictate.py:880` |
 | the dictation on/off/submit flow | `listen()` and `resolve_pending` |
 | what calibration measures | `CAL_PASSES` and `derive()`, and CALIBRATION.md with it |
 | install checks | `cmd_verify`, `snap_to_dictate.py` |
@@ -288,7 +290,7 @@ instead, and `--verify` says so.
 
 ### The catch-all
 
-`fallback_profile` (`snap_to_dictate.py:855`) builds a profile on the spot for
+`fallback_profile` (`snap_to_dictate.py:902`) builds a profile on the spot for
 any window that no entry in `profiles` claimed. It ships enabled, so an app
 nobody wired up behaves like one that was, using Windows' own voice typing.
 
@@ -312,8 +314,15 @@ than cosmetic, and each has tests.
 `lsass.exe`, `winlogon.exe`. Terminals are there for invariant 1. The rest are
 there because `enter` in those windows opens the selected icon, clicks Yes on a
 UAC prompt, submits a password box or ends a task. `fallback_profile` also
-returns `None` when the executable name is empty, so a window nothing can
-identify gets nothing rather than the default. `--verify` re-derives the whole
+refuses any window it cannot name, and that is wider than an empty string:
+`foreground_window` reports its three failures as descriptions rather than
+`None`, so the log can say which failure it was, and `<no foreground window>`,
+`<pid N: access denied, likely elevated>` and `<pid N: name unavailable>` are
+not image names. `is_named_window` rejects them on the angle brackets, which
+Win32 forbids in a filename. Before that check existed the catch-all accepted
+all three, so a snap while nothing was in front pressed the system key into
+whatever Windows routed it to, and the elevated one produced the SendInput
+error 5 crashes below. `--verify` re-derives the whole
 refusal by calling `fallback_profile` on every name in the list, so it checks
 the refusal instead of trusting it. **Add to this list. Do not cut from it.**
 
@@ -323,6 +332,16 @@ re-checks focus by comparing profile **names**, so a gesture begun in Chrome and
 finished after an alt-tab to Notepad is dropped rather than completed in the
 wrong app. One shared name across every unwired app would have removed that
 protection silently, because everything would have compared equal.
+
+**Every unwired window shares one session.** `session_of` returns the profile
+name for a named app and the shared `fallback` name for the catch-all, and the
+state machine's focus-moved reset compares sessions rather than names. Windows
+voice typing is one panel for the whole desktop, so alt-tabbing between two
+unwired apps is not a new dictation. Comparing names there made it look like
+one, and the next snap pressed `ctrl+space` to "start" a panel that was already
+open, which closes it. Everything after that is inverted. Keep the two
+questions apart: the **name** answers may this keystroke land in this window,
+the **session** answers is this the same dictation.
 
 **A profile that cannot press anything falls through to it.** `resolve_profile`
 breaks out of its loop when the matched profile fails `profile_ready()`, rather

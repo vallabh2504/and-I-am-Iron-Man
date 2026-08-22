@@ -256,8 +256,12 @@ send. A double snap presses Enter, and Enter is not a harmless key everywhere:
 
 Seventeen processes are refused outright. A window whose process cannot be
 identified is refused as well, because a window that cannot be named cannot be
-vouched for. `--verify` checks the list rather than trusting it, and the test
-suite asserts every entry individually.
+vouched for, and "cannot be named" covers more than an empty string. When there
+is no foreground window at all, when the session is locked, or when the window
+belongs to an elevated process, the tool records *why* it could not identify it
+and that description is not an application name. Those are refused too.
+`--verify` checks the list rather than trusting it, and the test suite reads the
+descriptions out of the source so a new one is covered the day it is added.
 
 Extend the list rather than cutting it down. An app wrongly left out gets no
 dictation and says so in the log. An app wrongly let in gets a keystroke nobody
@@ -268,6 +272,15 @@ One more thing keeps it honest. Each unwired app resolves under its own name,
 names. Start dictating in a browser, alt-tab to a text editor, and the two
 windows no longer carry the same name, so the stop is withheld instead of typed
 into the editor.
+
+Those names share one **session**, though, and that distinction matters. Windows
+voice typing is a single panel for the whole desktop, not one dictation per app,
+so alt-tabbing does not start a new one. If the tool treated the move as a fresh
+dictation it would press `ctrl+space` believing it was opening the panel, when
+what that actually does is close the panel already open, and every reading after
+that would be inverted: the log saying ON while the microphone is off. The name
+answers "may this keystroke land here". The session answers "is this the same
+dictation". They are not the same question.
 
 To turn the whole thing off, set `"enabled": false` on the `fallback` block, or
 clear its `activate`. Either one silences every unwired app.
@@ -495,6 +508,11 @@ python snap_to_dictate.py --stop
   reachable at any moment, so a refused keystroke is logged as `refused` and
   the listener carries on. It used to end the process instead, which is how
   two sessions were lost on 23 August 2026.
+- **A dictation you walk away from stays running.** Nothing can press a key into
+  a window that is not in front, so if you start dictating in an app and then
+  switch away without stopping, that app keeps recording until you go back and
+  snap again, or until it times out on its own. The log shows it as a `focus
+  moved` line. This is a limit of `SendInput`, not a setting.
 - **A snap in a refused window does nothing.** Terminals, the desktop shell, UAC
   and password prompts are on the never-touch list, so a snap there is written
   to `snap.log`, marked `skipped`, along with the process that had focus. That
