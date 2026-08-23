@@ -204,14 +204,14 @@ two multiples of 5.805 behaves exactly like the lower one.
 microphone
     │  256-sample blocks
     ▼
-SnapDetector.push()                  snap_to_dictate.py:267
+SnapDetector.push()                  snap_to_dictate.py:276
     │  per-block rFFT, high band 1500-16000 Hz vs an EMA noise floor
     │  ONSET gates  ─► VERIFY gates ─► one event with five features
     ▼
 event {peak_db, onset_hf, tail_hf, decay_ms, attack_ms, crest}
     │
     ▼
-TriggerGate.offer()                  snap_to_dictate.py:557
+TriggerGate.offer()                  snap_to_dictate.py:566
     │  refractory, single-vs-double pairing, the send window
     ▼
 listen() state machine               IDLE / RECORDING / SETTLING
@@ -229,14 +229,15 @@ counting the wrong thing. The event is the unit.
 
 | You want to change | Go to |
 |---|---|
-| what counts as a snap | `SnapDetector` gates, `snap_to_dictate.py:267` |
-| single vs double, pairing windows | `TriggerGate`, `snap_to_dictate.py:557` |
-| which key goes to which app | `resolve_profile`, `snap_to_dictate.py:873` |
-| what an app with no profile gets | `fallback_profile`, `snap_to_dictate.py:964` |
-| which windows are never typed into | `is_named_window` and `NEVER_FALLBACK`, `snap_to_dictate.py:917` |
-| which dictation a snap belongs to | `session_of`, `snap_to_dictate.py:942` |
-| how long a send stays possible, per app | `send_window_for`, `snap_to_dictate.py:2055` |
-| how long a held stop waits for its pair | `resolve_pending`, `snap_to_dictate.py:2213` |
+| what counts as a snap | `SnapDetector` gates, `snap_to_dictate.py:276` |
+| single vs double, pairing windows | `TriggerGate`, `snap_to_dictate.py:566` |
+| which key goes to which app | `resolve_profile`, `snap_to_dictate.py:939` |
+| what an app with no profile gets | `fallback_profile`, `snap_to_dictate.py:1030` |
+| which windows are never typed into | `is_named_window` and `NEVER_FALLBACK`, `snap_to_dictate.py:983` |
+| which dictation a snap belongs to | `session_of`, `snap_to_dictate.py:1008` |
+| how long a send stays possible, per app | `send_window_for`, `snap_to_dictate.py:2135` |
+| whether a foreground answer is trusted | `stable_foreground_window`, `snap_to_dictate.py:783` |
+| how long a held stop waits for its pair | `resolve_pending`, `snap_to_dictate.py:2293` |
 | the dictation on/off/submit flow | `listen()` and `resolve_pending` |
 | what calibration measures | `CAL_PASSES` and `derive()`, and CALIBRATION.md with it |
 | install checks | `cmd_verify`, `snap_to_dictate.py` |
@@ -293,7 +294,7 @@ any app without touching code, give it one of these.
 
 ### The catch-all
 
-`fallback_profile` (`snap_to_dictate.py:964`) builds a profile on the spot for
+`fallback_profile` (`snap_to_dictate.py:1030`) builds a profile on the spot for
 any window that no entry in `profiles` claimed. It ships enabled, so an app
 nobody wired up behaves like one that was, using Windows' own voice typing.
 
@@ -311,12 +312,31 @@ The fields mean what they mean in a profile. There is no `process` or `title`,
 because not matching is the point. Everything below is load-bearing rather than
 cosmetic, and each part has tests.
 
-**It refuses 22 processes and every window it cannot identify.**
-`NEVER_FALLBACK` is the `TERMINALS` list plus twelve more: `explorer.exe`,
-`consent.exe`,
-`logonui.exe`, `credentialuibroker.exe`, `taskmgr.exe`, `lsass.exe`,
-`winlogon.exe`, `startmenuexperiencehost.exe`, `searchhost.exe`,
-`searchapp.exe`, `shellexperiencehost.exe` and `textinputhost.exe`. Terminals
+**It refuses 33 processes and every window it cannot identify.**
+`NEVER_FALLBACK` is the 15-name `TERMINALS` list plus eighteen more:
+`explorer.exe`, `consent.exe`,
+`logonui.exe`, `credentialuibroker.exe`, `lockapp.exe`, `taskmgr.exe`,
+`lsass.exe`, `winlogon.exe`, `startmenuexperiencehost.exe`, `searchhost.exe`,
+`searchapp.exe`, `shellexperiencehost.exe`, `textinputhost.exe`, `mstsc.exe`
+and the four VS Code siblings `cursor.exe`, `code - insiders.exe`,
+`windsurf.exe`, `vscodium.exe`.
+
+The list is only as good as its coverage, and coverage is the failure mode. It
+held ten terminal names on a machine that also runs `wt.exe`,
+`openconsole.exe`, `bash.exe`, `ubuntu.exe` and `warp.exe`, and Claude Code
+lives in one of those: a terminal missing from this list is indistinguishable,
+from the outside, from the tool being broken. `lockapp.exe` owns the lock
+screen shell that `logonui.exe` was assumed to cover. `mstsc.exe` forwards
+keystrokes to a machine this program knows nothing about. In the four VS Code
+siblings `ctrl+space` is Trigger Suggest, so the tool fires IntelliSense,
+records dictation as ON, and reads every later snap against a fiction until
+`recording_max_s` expires three minutes on. Nothing here can tell whether a key
+did what it meant to, so the only defence is not sending it.
+
+Chat apps are deliberately NOT on this list. `enter` submits in Teams, Slack,
+Discord and Outlook, and submitting after a double snap is what the gesture is
+for. `applicationframehost.exe` is off it too, because refusing it would refuse
+every UWP window at once. Terminals
 are there for invariant 1. The rest are there because `enter` in those windows
 clicks Yes on a UAC prompt, submits a password box, ends a task, launches the
 highlighted Start menu entry or runs the top search result. `textinputhost.exe`
@@ -417,6 +437,49 @@ expiry in the main loop always fires first, which is why 2701 lines of log
 contain its message zero times. The expiry prints its own line now. Keep the
 `classify` branch - `cmd_replay` and the test suite both call it directly.
 
+**A focus change is consumed, not reused.** The branch in `listen()` that drops
+a held state when the window changed had no `continue`, so execution fell into
+the dispatch below with `state` now `IDLE`, which both classifiers read as a
+start, which pressed the NEW window's key. One snap, two effects. `snap.log`
+2026-08-23 17:11:04 carries both from a single event: "focus moved Claude
+desktop -> Codex" and "-> ctrl+b Codex voice ON". That is the whole of the
+user's report that Codex was triggered while they were working in Claude.
+The test asserts it against the parse tree, because a substring search for
+`continue` passes on a `continue` anywhere in a 300-line function.
+
+**A foreground answer has to hold still before it is acted on.**
+`stable_foreground_window` reads twice, `FOCUS_DWELL_MS` apart, and returns
+`(None, None)` when the two disagree. `GetForegroundWindow` samples an instant,
+and a window that owned the foreground for thirty milliseconds - a chat client
+flashing to front on a reply, an approval prompt, a notification activating its
+owner - is indistinguishable from the one the user has been typing in. 173
+snaps in `snap.log`, about 7% of everything detected, resolved to
+`<no foreground window>`; focus on this machine is genuinely unstable at the
+timescale of a snap.
+
+**`send_key_if_focused` compares SESSION, not name.** Asking the same question
+two different ways in two places is what broke it. The catch-all gives every
+unwired window its own name and one shared session, so the focus-change drop
+did not fire on a move between two unwired apps, the sessions being equal,
+while the name comparison here refused the stop anyway. State stayed
+`RECORDING`, every later snap repeated the refusal, and Windows voice typing -
+one panel for the whole desktop - went on typing into the new window until
+`recording_max_s` expired 180 seconds later. Dictate in a browser, alt-tab to a
+chat app, and there was no way to snap it off. Session still separates ChatGPT
+from Codex, which are one process at one PID, so nothing was given up.
+
+**A converse stop closes the door behind itself.** `classify_converse`
+completes the stop pair itself and returns without reaching
+`TriggerGate.offer`, which is the only writer of `cooldown_until`, so `reset()`
+cleared `pending_block` and left no cooldown at all. A third snap 520 to 860 ms
+later - inside the measured double range, and the natural thing to do when you
+are unsure the second one registered - reopened what had just been closed.
+`snap.log` has three OFF-then-ON oscillations between 18:52:52 and 18:52:57.
+`hold_off` starts the cooldown, and `drain` clears the queue the way the
+dictation send path already did. The `ARMED` lapse prints a line now too:
+arming presses nothing by design, so the log was the only feedback that a
+gesture was half finished, and it was silent through nine consecutive arms.
+
 **The detector is touched by two threads, and exactly one structure needs a
 lock.** `push` runs on the PortAudio callback thread; `speech_db` iterates
 `speech_hist` from the main loop while resolving a held stop. A deque raises
@@ -449,7 +512,7 @@ the deliberate restarts it destroys come out equal - 15 against 19 for the
 browser, 19 against 19 for Claude. There is no width that wins, because "send
 this" and "start again" are the same gesture at the same speed.
 
-`send_window_for` (`snap_to_dictate.py:2055`) still exists and a profile may
+`send_window_for` (`snap_to_dictate.py:2135`) still exists and a profile may
 still carry `send_window_ms`; nothing does today. Reach for it only with a
 measurement in hand. What the send actually depends on is the held stop - see
 **The double snap that sends** below.

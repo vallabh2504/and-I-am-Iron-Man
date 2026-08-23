@@ -184,7 +184,7 @@ What is wired out of the box:
 | Antigravity IDE | `antigravity ide.exe` | none | nothing, deliberately |
 | VS Code | `code.exe` | none | nothing, deliberately |
 | Anything else | nothing claims it, so the catch-all does | snap on, snap off, snap twice submits | `ctrl+space` through Windows, then `enter` |
-| 22 named processes | terminals, Explorer, the Start menu, search, UAC and password prompts | none | nothing, ever |
+| 33 named processes | terminals, Explorer, the lock screen, Remote Desktop, editors where `ctrl+space` is autocomplete, the Start menu, search, UAC and password prompts | none | nothing, ever |
 
 **Treat *Matched by* and *Sends* as this machine's answers, not yours.** The keys
 were the right ones for the app versions installed here on the day they were
@@ -287,6 +287,24 @@ dictation". They are not the same question.
 
 To turn the whole thing off, set `"enabled": false` on the `fallback` block, or
 clear its `activate`. Either one silences every unwired app.
+
+### A snap that finds a new window is spent finding it
+
+Move to a different app mid-dictation and the first snap over there does one
+thing only: it drops the state that belonged to the old window and says so. It
+does not also start anything. For one commit it did both, because the branch
+that dropped the state carried on into the code that presses keys, and with the
+state now clear that code read the snap as "start". One snap turned Claude's
+dictation off and Codex's voice agent on, and the log recorded both on the same
+second.
+
+The second thing that changed with it: the window has to hold still. Windows
+answers "what is in front" for the instant you ask, and plenty of windows own
+the foreground for a few dozen milliseconds without you ever looking at them, a
+chat client jumping forward when a reply lands being the ordinary case. The
+answer is read twice now, sixty milliseconds apart, and a snap that arrives
+while the answer is changing is ignored with a line in the log rather than
+aimed at a guess.
 
 ### An app with a profile is never the catch-all's business
 

@@ -247,7 +247,16 @@ DEFAULTS = {
 
 EPS = 1e-20
 RING_SAMPLES = 8192   # ~186 ms of raw audio at 44.1 kHz
-SPEECH_HISTORY_BLOCKS = 300   # ~1.7 s, comfortably past any one event
+# Long enough to answer the "before" question after a full-length held stop.
+# The lookback runs to 800 ms before the onset and the hold now runs to 911 ms
+# after it, so a horizon of 300 blocks (1741 ms) fell a handful of blocks short
+# and speech_db began returning None for the before column on exactly the stops
+# that needed it: 50 of 50 resolutions carried it before the hold was
+# lengthened, 4 of 18 after. 420 blocks is 2438 ms, which clears it with room.
+SPEECH_HISTORY_BLOCKS = 420   # ~2.4 s, past a full hold plus the lookback
+
+# How long the foreground answer has to hold still before it is acted on.
+FOCUS_DWELL_MS = 60.0
 PENDING_TIMEOUT_MS = 1200.0   # if the silence check cannot answer, stop anyway
 
 
@@ -562,7 +571,6 @@ class TriggerGate:
         self.block_ms = block_ms
         self.pending_block = None
         self.cooldown_until = -1
-        self.last_gap_ms = None   # gap to the previous transient, when there was one
 
     def offer(self, event):
         blk = event["block"]
@@ -574,16 +582,31 @@ class TriggerGate:
             self.cooldown_until = blk + cooldown_blocks
             return True
 
-        self.last_gap_ms = None
         if self.pending_block is not None:
             gap_ms = (blk - self.pending_block) * self.block_ms
-            self.last_gap_ms = gap_ms
             if self.cfg["double_min_ms"] <= gap_ms <= self.cfg["double_max_ms"]:
                 self.pending_block = None
                 self.cooldown_until = blk + cooldown_blocks
                 return True
         self.pending_block = blk
         return False
+
+    def hold_off(self, block):
+        """Start the trigger cooldown without offering an event.
+
+        offer() is the only other writer of cooldown_until, and the converse
+        stop never reaches it: classify_converse completes the pair itself,
+        presses the key and returns, so reset() cleared pending_block and left
+        the cooldown untouched. A third snap 520 to 860 ms later - squarely
+        inside the measured double-snap range, and the natural thing to do when
+        you are not sure the second one registered - walked straight back in
+        and reopened the voice mode that had just been closed. snap.log
+        2026-08-23 has three OFF-then-ON oscillations between 18:52:52 and
+        18:52:57.
+        """
+        self.pending_block = None
+        self.cooldown_until = block + int(
+            self.cfg["trigger_cooldown_ms"] / self.block_ms)
 
     def reset(self):
         """Forget a half-finished double snap.
@@ -757,6 +780,33 @@ def window_title(hwnd):
     return buf.value
 
 
+def stable_foreground_window(dwell_ms=FOCUS_DWELL_MS):
+    """Read the foreground window twice and believe only an agreeing answer.
+
+    GetForegroundWindow samples an instant. A window that owned the foreground
+    for thirty milliseconds - a chat client flashing to front on a completed
+    reply, an approval prompt, a notification activating its owner - is
+    indistinguishable from one the user has been working in for a minute. The
+    keystroke this program sends is aimed at wherever the user believes they
+    are typing, which is the window that has been there for longer than a
+    blink.
+
+    That gap is not theoretical. snap.log on 2026-08-23 carries "focus moved
+    Claude desktop -> Codex" and "-> ctrl+b Codex voice ON" on the same second
+    from one snap, and 173 snaps in the same file resolved to
+    "<no foreground window>", about 7% of everything detected. Focus on this
+    machine is genuinely unstable at the timescale of a snap.
+
+    Returns (exe, title), or (None, None) when the two reads disagree, which
+    means the answer was not stable enough to act on. The dwell costs one
+    FOCUS_DWELL_MS pause per snap, on the main loop, never on the audio
+    callback.
+    """
+    first = foreground_window()
+    time.sleep(dwell_ms / 1000.0)
+    return first if first == foreground_window() else (None, None)
+
+
 def foreground_window():
     """(image name, window title) for the foreground window, or why not.
 
@@ -790,11 +840,6 @@ def foreground_window():
     return "<pid %d: name unavailable>" % pid.value, ""
 
 
-def foreground_exe():
-    """Just the image name, for callers that do not care which window it is."""
-    return foreground_window()[0]
-
-
 def legacy_profile(cfg):
     """The pre-profiles config expressed as one dictation profile per process.
 
@@ -817,6 +862,13 @@ TERMINALS = frozenset({
     "windowsterminal.exe", "powershell.exe", "pwsh.exe", "cmd.exe",
     "conhost.exe", "wezterm-gui.exe", "alacritty.exe", "kitty.exe",
     "hyper.exe", "mintty.exe",
+    # The list was ten names and the machine it runs on has more. wt.exe is
+    # what Windows Terminal is actually launched as; openconsole.exe is the
+    # console host that replaced conhost; bash.exe and ubuntu.exe are the WSL
+    # entry points; warp.exe is a terminal too. Claude Code runs in one of
+    # these, and "even during using claude code, CTRL + SPACE is turning on"
+    # is what a terminal missing from this list looks like from the outside.
+    "wt.exe", "openconsole.exe", "bash.exe", "ubuntu.exe", "warp.exe",
 })
 
 # What the catch-all refuses to type into, on top of every terminal.
@@ -862,6 +914,20 @@ NEVER_FALLBACK = TERMINALS | frozenset({
     "taskmgr.exe", "lsass.exe", "winlogon.exe",
     "startmenuexperiencehost.exe", "searchhost.exe", "searchapp.exe",
     "shellexperiencehost.exe", "textinputhost.exe",
+    # LogonUI and CredentialUIBroker were here; LockApp.exe is the process that
+    # actually owns the lock screen shell, so a snap while locked was typing
+    # into it.
+    "lockapp.exe",
+    # Remote Desktop forwards every keystroke to a machine this program knows
+    # nothing about, including whatever shell is open over there.
+    "mstsc.exe",
+    # code.exe has a profile, which keeps the catch-all out of it. Its four
+    # siblings had nothing, and in all of them ctrl+space is Trigger Suggest:
+    # the tool fires IntelliSense, records that dictation is now ON, and every
+    # snap after that is read against a fiction until recording_max_s expires
+    # three minutes later. Nothing here can tell whether a key did what it
+    # meant to, so the only defence is not sending it.
+    "cursor.exe", "code - insiders.exe", "windsurf.exe", "vscodium.exe",
 })
 
 
@@ -1045,15 +1111,29 @@ def send_key_if_focused(mod_vks, key_vk, prof, cfg, what):
     here, immediately before the press, so the gap between deciding and sending
     is as small as it can be made.
 
-    Matching is by profile name, not process, because two profiles can share one
-    executable - ChatGPT and Codex are one process at one PID, separated only by
-    their titles. Name is the identity the rest of the loop already uses.
+    Matching is by SESSION, which is the same question the focus-change drop in
+    listen() asks. Asking it two different ways in two places is what broke
+    this. Session is not process: ChatGPT and Codex are one process at one PID
+    separated only by their titles, and they are two sessions, so a stop still
+    cannot migrate between them.
+
+    It matched by NAME once, and for the catch-all that deadlocked. Every
+    unwired window gets its own name with the exe in it, and they all share one
+    session, because Windows voice typing is a single panel for the whole
+    desktop. So the focus-change drop did not fire on a move between two
+    unwired apps, the sessions being equal, while this check refused the stop
+    anyway, the names being different. State stayed RECORDING, every following
+    snap repeated the refusal, and the panel went on typing into the new window
+    until recording_max_s expired 180 seconds later. Dictate in a browser,
+    alt-tab to a chat app, and there was no way to snap it off. The key is the
+    identical ctrl+space in both windows, so there was never anything to
+    protect against.
 
     Returns True if the key was sent.
     """
     exe, title = foreground_window()
     now = resolve_profile(exe, title, cfg)
-    if now is not None and now["name"] == prof["name"]:
+    if now is not None and session_of(now) == session_of(prof):
         return send_key_guarded(mod_vks, key_vk, prof, what)
     where = "%s%s" % (exe, (" [%s]" % loggable(title)) if title else "")
     print("[%s] dropped %s for %s; focus moved to %s"
@@ -2280,34 +2360,52 @@ def resolve_pending(pending, det, cfg, dry_run, events, state, since,
         return state, since, pending
 
     stamp = time.strftime("%H:%M:%S")
-    # The silence question is a guess about intent, and a confirming snap has
-    # already answered it. Asking it anyway is worse than redundant, because
-    # the second snap of a pair lands inside speech_window_ms - 150 to 300 ms
+    # The level AFTER the transient cannot decide this on its own, because the
+    # confirming snap of a pair lands inside speech_window_ms - 150 to 300 ms
     # after the onset, against measured pair gaps of 76 to 989 ms - and raises
-    # the very level being measured. snap.log, 2026-08-23:
+    # the very level being measured. A deliberate double snap made the room
+    # loud and was then refused for it, losing the stop and the send together.
+    #
+    # Dropping the veto whenever a pair arrived is wrong too, and the same log
+    # has both counter-examples within an hour of each other:
     #
     #   [18:58:29] held  ...  holding as a send confirmation
-    #   [18:58:29] snap  ...  still talking 14 dB over the floor
-    #                         150-300 ms later; not a stop  [before 4 dB]
+    #              snap  ...  still talking 14 dB ... not a stop  [before  4 dB]
+    #   [18:03:23] held  ...  holding as a send confirmation
+    #              snap  ...  still talking 29 dB ... not a stop  [before 24 dB]
     #
-    # Quiet before the transient, loud after it, and the loud part was the
-    # confirmation itself. Both snaps were discarded, so the user got neither
-    # the stop nor the send: a double snap failed for being deliberate.
+    # The first is a deliberate double into a quiet room, where the noise after
+    # was the confirmation itself. The second is five transients in sixteen
+    # seconds of continuous speech, two of which happened to clear the gates: a
+    # false stop that would now press Enter into a browser as well.
     #
-    # The veto therefore applies only to a lone stop, where there is genuinely
-    # something left to infer. What that costs is two false positives inside
-    # one hold now stopping and sending instead of being caught here. That
-    # pair has to clear expect_pair's gates first, and a person who snapped
-    # twice on purpose is the case this program exists for.
-    if (pending["follow"] is None
-            and level is not None and level >= cfg["speech_over_floor_db"]):
+    # The before column separates them cleanly, 4 dB against 24 dB with the
+    # threshold at 14, and it was already being computed and thrown away. So a
+    # pair outranks the veto only when the room was quiet BEFORE the first
+    # snap. A pair in the middle of speech is still refused, because two false
+    # positives inside one hold is a real event and not a hypothetical.
+    #
+    # With no before column there is no discriminator, so the veto stands: a
+    # missed send costs another snap, a false stop costs a stray Enter.
+    # Raising SPEECH_HISTORY_BLOCKS to 420 is what keeps that case rare, and
+    # the log names it so it can be counted rather than assumed.
+    loud_after = level is not None and level >= cfg["speech_over_floor_db"]
+    quiet_before = before is not None and before < cfg["speech_over_floor_db"]
+    confirmed = pending["follow"] is not None
+    if loud_after and not (confirmed and quiet_before):
+        if not confirmed:
+            why = "not a stop"
+        elif before is None:
+            why = "a pair confirmed it, but the before level is unknown"
+        else:
+            why = "a pair confirmed it, but the room was already talking"
         print("[%s] snap    %s  still talking %.0f dB over the floor "
-              "%.0f-%.0f ms later; not a stop%s"
-              % (stamp, pending["detail"], level, lo_ms, hi_ms, was))
+              "%.0f-%.0f ms later; %s%s"
+              % (stamp, pending["detail"], level, lo_ms, hi_ms, why, was))
         return state, since, None
-    if (level is not None and level >= cfg["speech_over_floor_db"]):
-        print("[%s] held    %s  %.0f dB over the floor after, but the pair "
-              "confirmed it; stopping anyway%s"
+    if loud_after:
+        print("[%s] held    %s  %.0f dB over the floor after, but quiet "
+              "before it and a pair confirmed it; stopping anyway%s"
               % (stamp, pending["detail"], level, was))
 
     heard = "quiet" if level is None else "%.0f dB over the floor" % level
@@ -2331,6 +2429,10 @@ def resolve_pending(pending, det, cfg, dry_run, events, state, since,
     start_gate.reset()
 
     follow = pending["follow"]
+    if follow is not None and vk_send is None:
+        print("[%s] snap    %s  %s has no send key; nothing submitted"
+              % (stamp, pending["detail"], prof["name"]))
+        follow = None
     if follow is not None:
         if dry_run:
             print("[%s] TRIGGER %s  would send (dry run)"
@@ -2338,9 +2440,14 @@ def resolve_pending(pending, det, cfg, dry_run, events, state, since,
         else:
             time.sleep(cfg["send_delay_ms"] / 1000.0)
             if send_key_if_focused(mod_send, vk_send, prof, cfg, "the submit"):
-                print("[%s] TRIGGER %s  -> %s  SENT"
-                      % (time.strftime("%H:%M:%S"), pending["detail"],
-                         prof["send"]))
+                # The confirming snap's own block, not the stop's. Both lines
+                # used to print pending["detail"], so the log showed one block
+                # number for two different snaps and the gap between them - the
+                # one number anybody tuning this needs - could not be recovered.
+                print("[%s] TRIGGER blk %7d  confirmed the stop at blk %7d "
+                      " -> %s  SENT"
+                      % (time.strftime("%H:%M:%S"), follow["block"],
+                         pending["ev"]["block"], prof["send"]))
             drain(events)
         state, since = IDLE, time.monotonic()
         start_gate.reset()
@@ -2532,6 +2639,17 @@ def listen(cfg, dry_run, instance, watch, record=None):
             # has been going for at least a second. Making the user wait it out
             # again would swallow their next honest attempt to stop.
             elif state == ARMED and held_ms > send_window_for(active, cfg):
+                # Say so. Arming presses nothing by design, so the only signal
+                # the user has that they are half way through a gesture is this
+                # log. snap.log 2026-08-23 18:52:26 to 18:52:57 has nine armed
+                # lines in a row, two to three seconds apart, each lapsing in
+                # silence: somebody snapping over and over to end a voice
+                # conversation while the app was never touched.
+                print("[%s] lapsed  %s pair window closed after %.0f ms; "
+                      "still talking, snap twice to end it"
+                      % (time.strftime("%H:%M:%S"),
+                         (active or {}).get("name", "the"),
+                         send_window_for(active, cfg)))
                 state = TALKING
                 since = now - cfg["min_recording_ms"] / 1000.0
                 held_ms = cfg["min_recording_ms"]
@@ -2549,11 +2667,37 @@ def listen(cfg, dry_run, instance, watch, record=None):
                 # it is the confirmation that this message should be sent, and
                 # it has to survive until the stop it confirms actually happens.
                 if ev is not None:
-                    if strict.accepts(ev["peak_db"], ev["tail_hf"],
-                                      ev["decay_ms"]):
+                    # Three ways this is not the confirmation, and every one of
+                    # them used to be silent. classify logs "too dull to
+                    # confirm a send" for the same rejection in SETTLING, while
+                    # this path logged nothing: 12.4% of accepted snaps in
+                    # snap.log have tail_hf below 0.70, so roughly one double
+                    # snap in seven vanished here without a line. The upper
+                    # bound was missing outright, because the hold only bounds
+                    # how long we WAIT, so a transient a second and a bit later
+                    # still counted as the pair.
+                    gap_ms = ((ev["block"] - pending["ev"]["block"])
+                              * det.block_ms)
+                    fstamp = time.strftime("%H:%M:%S")
+                    if pending["follow"] is not None:
+                        print("[%s] snap    blk %7d  %.0f ms after the stop; "
+                              "already confirmed, ignored"
+                              % (fstamp, ev["block"], gap_ms))
+                    elif not strict.accepts(ev["peak_db"], ev["tail_hf"],
+                                            ev["decay_ms"]):
+                        print("[%s] snap    blk %7d  tail_hf %.2f, too dull to "
+                              "confirm a send (%.0f ms after the stop)"
+                              % (fstamp, ev["block"], ev["tail_hf"], gap_ms))
+                    elif gap_ms > cfg["double_max_ms"]:
+                        print("[%s] snap    blk %7d  %.0f ms after the stop is "
+                              "past the %.0f ms pair window; not a confirmation"
+                              % (fstamp, ev["block"], gap_ms,
+                                 cfg["double_max_ms"]))
+                    else:
                         pending["follow"] = ev
-                        print("[%s] held    %s  holding as a send confirmation"
-                              % (time.strftime("%H:%M:%S"), pending["detail"]))
+                        print("[%s] held    blk %7d  %.0f ms after the stop; "
+                              "holding as a send confirmation"
+                              % (fstamp, ev["block"], gap_ms))
                     ev = None
                 state, since, pending = resolve_pending(
                     pending, det, cfg, dry_run,
@@ -2575,7 +2719,11 @@ def listen(cfg, dry_run, instance, watch, record=None):
             # while something unrouted is in front has nothing to do with us,
             # and letting it reach start_gate would burn the trigger cooldown -
             # so the next snap, the real one, would be swallowed.
-            exe, title = foreground_window()
+            exe, title = stable_foreground_window()
+            if exe is None:
+                print("[%s] snap    %s  focus was still moving; ignored"
+                      % (stamp, detail))
+                continue
             prof = resolve_profile(exe, title, cfg)
             where = "%s%s" % (exe, (" [%s]" % loggable(title)) if title else "")
 
@@ -2592,16 +2740,27 @@ def listen(cfg, dry_run, instance, watch, record=None):
             # A dictation session belongs to the window that started it. If the
             # user has moved on to a different app, we cannot stop the old one
             # from here, and carrying its state over would make the next snap
-            # mean "stop" in a window that never started. Drop to idle and let
-            # this snap be read fresh under the profile actually in front.
+            # mean "stop" in a window that never started. Drop to idle.
+            #
+            # And stop there. For one commit this branch fell through into the
+            # dispatch below, so a single snap dropped the old window's state
+            # and then, reading as a start because the state was now IDLE,
+            # pressed the NEW window's key. snap.log 2026-08-23 17:11:04 has
+            # both halves from one event: "focus moved Claude desktop -> Codex"
+            # and "-> ctrl+b Codex voice ON". The user reported it as Codex
+            # being triggered while they were working in Claude, and they were
+            # right. A snap that discovers a focus change is spent on
+            # discovering it; the next one is the gesture.
             if active is not None \
                     and session_of(prof) != session_of(active) \
                     and state != IDLE:
-                print("[%s] focus   moved %s -> %s; dropping the held %s state"
+                print("[%s] focus   moved %s -> %s; dropping the held %s "
+                      "state, and this snap with it"
                       % (stamp, active["name"], prof["name"], state))
                 state, since, active = IDLE, time.monotonic(), None
                 start_gate.reset()
                 held_ms = 0.0
+                continue
 
             mod_vks, key_vk, mod_send, vk_send = keys_for(prof)
 
@@ -2657,6 +2816,13 @@ def listen(cfg, dry_run, instance, watch, record=None):
                     print("[%s] TRIGGER %s  -> %s  %s voice %s"
                           % (stamp, detail, prof["activate"], prof["name"],
                              "ON" if action == "start" else "OFF"))
+                    if action == "stop":
+                        # Close the door behind the pair. Without these two the
+                        # snap that ended a conversation could be followed 520
+                        # ms later by one that started it again, which is what
+                        # snap.log recorded three times in five seconds.
+                        start_gate.hold_off(ev["block"])
+                        drain(events)
                 state = {"start": TALKING, "arm": ARMED, "stop": IDLE}[action]
                 active = prof if state != IDLE else None
                 since = time.monotonic()
@@ -2705,6 +2871,18 @@ def listen(cfg, dry_run, instance, watch, record=None):
                 # The activate key has already been pressed; the transcript is
                 # still landing. Wait out whatever is left of send_delay_ms
                 # measured from that keypress, not from this snap.
+                # classify decides a send from the state, the window and the
+                # shape of the snap; it never asks whether there is a key to
+                # send with. A dictation profile written without one would
+                # reach send_key(None, None) and take the listener down with a
+                # TypeError, which send_key_guarded does not catch because it
+                # catches OSError. No config has that shape today. Ask anyway:
+                # the cost is one comparison and the alternative is a crash.
+                if vk_send is None:
+                    print("[%s] snap    %s  %s has no send key; nothing "
+                          "submitted" % (stamp, detail, prof["name"]))
+                    state, since, active = IDLE, time.monotonic(), None
+                    continue
                 rest = cfg["send_delay_ms"] - held_ms
                 if rest > 0:
                     time.sleep(rest / 1000.0)

@@ -750,12 +750,135 @@ try:
 finally:
     _s.foreground_window = _real_fg
 
+# --- 2026-08-23, second pass: what a skeptical read of the whole file found --
+
+# 1. A focus change used to be CONSUMED and then REUSED. The branch that drops
+# the old window's state had no `continue`, so execution fell into the dispatch
+# below with state now IDLE, which reads as a start, which pressed the NEW
+# window's key. One snap, two effects. snap.log 17:11:04 has both from one
+# event: "focus moved Claude desktop -> Codex" and "-> ctrl+b Codex voice ON".
+# That is the user's report of Codex being triggered while they were in Claude.
+#
+# Asserted against the parse tree, not the text. A substring check for
+# "continue" would pass on a `continue` anywhere in the function, and the whole
+# bug was one statement being in the wrong block.
+import ast as _ast
+
+_tree = _ast.parse(_src)
+_listen_fn = next(n for n in _ast.walk(_tree)
+                  if isinstance(n, _ast.FunctionDef) and n.name == "listen")
+
+
+def _says(node, text):
+    return any(isinstance(c, _ast.Constant) and isinstance(c.value, str)
+               and text in c.value for c in _ast.walk(node))
+
+
+_drop = [n for n in _ast.walk(_listen_fn)
+         if isinstance(n, _ast.If) and _says(n, "focus   moved")]
+check("the focus-change branch exists exactly once", len(_drop), 1)
+check("...and it ends the iteration rather than falling into the dispatch",
+      isinstance(_drop[0].body[-1], _ast.Continue), True)
+
+# 2. The delayed guard asks about the SESSION, not the name. The catch-all
+# gives every unwired window its own name and one shared session, so a name
+# comparison refused the stop for a panel that is the same panel, forever:
+# state stayed RECORDING and every later snap repeated the refusal until
+# recording_max_s expired three minutes on. Dictate in a browser, alt-tab to a
+# chat app, and there was no way to snap it off.
+_edge = _s.resolve_profile("msedge.exe", "something", CATCHALL)
+_teams = _s.resolve_profile("ms-teams.exe", "chat", CATCHALL)
+check("two unwired windows are two names", _edge["name"] != _teams["name"],
+      True)
+check("...and one session", _s.session_of(_edge), _s.session_of(_teams))
+# send_key is stubbed rather than left real: this branch is the one that DOES
+# press, and a test suite that types into whatever window happens to be in
+# front is its own bug report.
+_s.foreground_window = lambda: ("ms-teams.exe", "chat")
+_real_send, _sent = _s.send_key, []
+_s.send_key = lambda mod_vks, key_vk: _sent.append(key_vk)
+try:
+    check("...so the stop still lands after alt-tabbing between them",
+          _s.send_key_if_focused((), 0x20, _edge, CATCHALL, "the stop"), True)
+    check("...and it is the panel's own key that gets pressed", _sent, [0x20])
+finally:
+    _s.send_key, _s.foreground_window = _real_send, _real_fg
+
+# ...while two profiles sharing one executable stay two sessions, which is the
+# case the guard was written for: ChatGPT and Codex are one process at one PID.
+_codex = _s.resolve_profile("chatgpt.exe", "Codex - snap", CATCHALL)
+_gpt = _s.resolve_profile("chatgpt.exe", "ChatGPT - snap", CATCHALL)
+check("one executable can still hold two sessions",
+      _s.session_of(_codex) != _s.session_of(_gpt), True)
+_s.foreground_window = lambda: ("chatgpt.exe", "ChatGPT - snap")
+_real_send, _sent = _s.send_key, []
+_s.send_key = lambda mod_vks, key_vk: _sent.append(key_vk)
+try:
+    check("...so a held stop never migrates between them",
+          _s.send_key_if_focused((), 0x20, _codex, CATCHALL, "the stop"), False)
+    check("...and nothing at all is pressed on the way out", _sent, [])
+finally:
+    _s.send_key, _s.foreground_window = _real_send, _real_fg
+
+# 3. A foreground answer has to hold still before it is acted on. Windows
+# reports whatever owned the foreground at that instant, and a window that had
+# it for thirty milliseconds - a chat client flashing to front on a reply, a
+# notification activating its owner - is indistinguishable from the one the
+# user has been working in. 173 snaps in snap.log resolved to
+# "<no foreground window>", about 7% of everything detected.
+_answers = [("claude.exe", "Claude"), ("chatgpt.exe", "Codex")]
+_s.foreground_window = lambda: _answers.pop(0)
+try:
+    check("a foreground that changes under the dwell is refused, not guessed",
+          _s.stable_foreground_window(0.0), (None, None))
+finally:
+    _s.foreground_window = _real_fg
+_s.foreground_window = lambda: ("claude.exe", "Claude")
+try:
+    check("...and one that holds still is returned",
+          _s.stable_foreground_window(0.0), ("claude.exe", "Claude"))
+finally:
+    _s.foreground_window = _real_fg
+
+# 4. The refusal list was ten terminals on a machine that runs more of them.
+# Enter in any of these runs whatever is on the command line, and Claude Code
+# lives in one, which is the most ordinary reading of "even during using claude
+# code, CTRL + SPACE is turning on".
+for _exe in ("wt.exe", "openconsole.exe", "bash.exe", "ubuntu.exe",
+             "warp.exe", "lockapp.exe", "mstsc.exe", "cursor.exe",
+             "windsurf.exe", "vscodium.exe", "code - insiders.exe"):
+    check("the catch-all refuses %s" % _exe,
+          _s.resolve_profile(_exe, "anything", CATCHALL), None)
+check("every terminal name is still inside the refusal list",
+      _s.TERMINALS <= _s.NEVER_FALLBACK, True)
+
+# 5. A converse stop has to close the door behind itself. classify_converse
+# completes the pair, presses the key and returns without ever reaching
+# TriggerGate.offer, so the cooldown that offer would have started was never
+# started and reset() only cleared pending_block. A third snap 520 to 860 ms
+# later reopened what had just been closed: snap.log has three OFF-then-ON
+# oscillations between 18:52:52 and 18:52:57.
+_g = TriggerGate(live, bm)
+_g.hold_off(1000)
+check("a converse stop starts the trigger cooldown",
+      _g.offer({"block": 1000 + int(live["trigger_cooldown_ms"] / bm) - 2}),
+      False)
+check("...and it is over when the cooldown says it is",
+      _g.cooldown_until, 1000 + int(live["trigger_cooldown_ms"] / bm))
+check("reset alone never started one, which is why this exists",
+      "cooldown_until" in inspect.getsource(_s.TriggerGate.reset), False)
+
 # Every send inside the listen loop has to go through one of the two guarded
 # forms, or one refused keystroke ends the process for every other window too.
 _listen = _src[_src.index("def listen"):]
 _listen = _listen[:_listen.index(NL_ + "def ", 10)]
+# Code lines only. A comment naming send_key(None, None) to explain why it is
+# guarded against is not a call, and reading it as one punishes the comment for
+# being specific.
+_listen_code = NL_.join(l for l in _listen.splitlines()
+                        if not l.strip().startswith("#"))
 check("no send inside the listen loop bypasses the guard",
-      "send_key(" in _listen.replace("send_key_guarded(", "")
+      "send_key(" in _listen_code.replace("send_key_guarded(", "")
       .replace("send_key_if_focused(", ""), False)
 
 
@@ -854,28 +977,28 @@ check("the listener logs titles through loggable()",
 check("...but resolves profiles against the raw title",
       "resolve_profile(exe, title" in inspect.getsource(_s.listen), True)
 
-# --- the stop guard records what it does not yet use -------------------------
+# --- the stop guard, and the one decision the before column now carries ------
 # Four numbers were measured against a real session and none of them separates
 # a stop the user wanted from one they undid: attack, crest, tail_hf, decay,
 # peak and recording length all overlap, and the level the guard itself
 # measures had the same median, 6 dB, in both cases. The level BEFORE the
-# transient is the one question never asked. It is logged now and gates
-# nothing, and these checks hold that line: recorded, and still not acted on.
+# transient is the one question never asked.
+#
+# It still decides nothing about a LONE stop, which is what the false-positive
+# data being collected depends on: with no confirming snap the veto behaves
+# exactly as it always has, and the column is recorded and not acted on. The
+# behavioural proof of that is with the resolve_pending tests further down.
+#
+# What it does decide is narrower, and that question only exists because the
+# confirming snap of a pair lands inside the very window the veto measures:
+# whether a confirmed pair may override the veto. snap.log 2026-08-23 has both
+# cases an hour apart. 18:58:29, before 4 dB, a deliberate double into a quiet
+# room. 18:03:23, before 24 dB, two false positives inside sixteen seconds of
+# continuous speech, which under an unconditional override would have pressed
+# ctrl+space and then Enter into a browser mid-sentence.
 _rp = inspect.getsource(_s.resolve_pending)
 check("the stop guard records the level before the transient",
       "det.speech_db(pending[\"ev\"][\"onset_block\"], -800, -100)" in _rp, True)
-check("...on the stop it allows",
-      _rp.count("heard += was") == 1, True)
-check("...and on the stop it rejects",
-      "not a stop%s" in _rp, True)
-# Counted over code lines only, because the phrase "if before is None" in the
-# formatting ternary is not a decision about the stop and a substring search
-# reads it as one.
-_uses = [l.strip() for l in _rp.splitlines()
-         if "before" in l and not l.strip().startswith("#")]
-check("...and 'before' is only ever measured and formatted, never tested",
-      _uses, ['before = det.speech_db(pending["ev"]["onset_block"], -800, -100)',
-              'was = "" if before is None else "  [before %.0f dB]" % before'])
 
 # README quotes concrete numbers at the reader, and those numbers are promises
 # about what the tool will do. They came adrift once already: calibration wrote
@@ -1134,11 +1257,25 @@ check("the pair window is what the hold waits for, not a number of its own",
 # Quiet before, loud after, and the loud part was the confirmation. The user
 # got neither the stop nor the send. A pair states the intent the guard is
 # trying to infer, so a confirmed pair outranks it.
-class _LoudRoom:
-    """A detector stub for which the speech band never goes quiet."""
+class _Room:
+    """A detector stub that answers before and after the transient separately.
+
+    resolve_pending asks the same method two questions - the level 150 to 300 ms
+    after the onset, and the level 800 to 100 ms before it - and the sign of
+    lo_ms is what tells them apart. A stub returning one constant cannot
+    exercise the rule below, which is exactly why the bug it encodes was found
+    in snap.log rather than here.
+    """
+
+    def __init__(self, before, after):
+        self.before, self.after = before, after
 
     def speech_db(self, onset_block, lo_ms, hi_ms):
-        return live["speech_over_floor_db"] + 6.0
+        return self.before if lo_ms < 0 else self.after
+
+
+_LOUD = live["speech_over_floor_db"] + 6.0
+_SOFT = live["speech_over_floor_db"] - 6.0
 
 
 def _resolve_in(room, pending):
@@ -1146,17 +1283,40 @@ def _resolve_in(room, pending):
                               RECORDING, _tm.monotonic(), start_gate)
 
 
-_state, _, _rest = _resolve_in(_LoudRoom(),
+# The lone stop is untouched, in both directions. This is the check that keeps
+# the false-positive data being collected comparable across this change.
+_state, _, _rest = _resolve_in(_Room(_SOFT, _LOUD),
                                _held(live["double_max_ms"] + 50.0))
-check("a lone stop into a loud room is still refused",
+check("a lone stop is still refused when the room is loud after it",
       (_state, _rest), (RECORDING, None))
-_state, _, _rest = _resolve_in(_LoudRoom(), _held(0.0, follow=event(GOOD, 20)))
-check("...but a confirmed pair stops and sends however loud the room is",
+_state, _, _rest = _resolve_in(_Room(_LOUD, _SOFT),
+                               _held(live["double_max_ms"] + 50.0))
+check("...and a loud room BEFORE the snap still decides nothing on its own",
+      (_state, _rest), (SETTLING, None))
+
+# The pair is where the before column earns its keep.
+_state, _, _rest = _resolve_in(_Room(_SOFT, _LOUD),
+                               _held(0.0, follow=event(GOOD, 20)))
+check("a pair out of a quiet room stops and sends despite the noise after",
       (_state, _rest), (IDLE, None))
-check("the refusal asks whether a pair confirmed it",
-      'if (pending["follow"] is None' in _src, True)
-check("...and the override says so in the log rather than passing silently",
-      "but the pair " in _src, True)
+_state, _, _rest = _resolve_in(_Room(_LOUD, _LOUD),
+                               _held(0.0, follow=event(GOOD, 20)))
+check("...but a pair in the middle of speech is still refused",
+      (_state, _rest), (RECORDING, None))
+_state, _, _rest = _resolve_in(_Room(None, _LOUD),
+                               _held(0.0, follow=event(GOOD, 20)))
+check("...and with no before column to judge by, the veto stands",
+      (_state, _rest), (RECORDING, None))
+
+# The horizon has to reach back far enough for that column to exist at all.
+# 300 blocks did not: the lookback needs history to onset-138, the hold runs to
+# onset+163 or so, and 300 blocks only reaches onset-136. snap.log measured the
+# damage directly - 50 of 50 resolutions carried the before column before the
+# hold was lengthened, 4 of 18 after.
+_lookback_blocks = int(round(800.0 / bm))
+_hold_blocks = int(round(live["double_max_ms"] / bm))
+check("the speech history outlasts a full hold plus the lookback",
+      _s.SPEECH_HISTORY_BLOCKS > _lookback_blocks + _hold_blocks + 30, True)
 
 # classify still refuses a late send, and that branch is now unreachable from
 # listen(): the expiry above always fires first. 2701 lines of snap.log contain
