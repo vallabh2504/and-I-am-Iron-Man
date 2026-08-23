@@ -56,7 +56,7 @@
     {
       "name": "Codex",
       "process": "chatgpt.exe",
-      "title": "^Codex$",
+      "title": "^Codex\\b",
       "mode": "converse",
       "activate": "ctrl+b",
       "send": null,
@@ -65,7 +65,7 @@
     {
       "name": "ChatGPT",
       "process": "chatgpt.exe",
-      "title": "^ChatGPT$",
+      "title": "^ChatGPT\\b",
       "mode": "converse",
       "activate": "ctrl+b",
       "send": null,
@@ -106,7 +106,6 @@
     "mode": "dictation",
     "activate": "ctrl+space",
     "send": "enter",
-    "enabled": true,
-    "send_window_ms": 2500.0
+    "enabled": true
   }
 }

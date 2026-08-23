@@ -183,10 +183,10 @@ DEFAULTS = {
         # feature needing the full start/stop/submit gesture; switch this
         # profile to {"mode": "dictation", "activate": "ctrl+m",
         # "send": "enter"} if the typed transcript is what is wanted here.
-        {"name": "Codex", "process": "chatgpt.exe", "title": "^Codex$",
+        {"name": "Codex", "process": "chatgpt.exe", "title": r"^Codex\b",
          "mode": "converse", "activate": "ctrl+b", "send": None,
          "enabled": True},
-        {"name": "ChatGPT", "process": "chatgpt.exe", "title": "^ChatGPT$",
+        {"name": "ChatGPT", "process": "chatgpt.exe", "title": r"^ChatGPT\b",
          "mode": "converse", "activate": "ctrl+b", "send": None,
          "enabled": True},
 
@@ -238,9 +238,6 @@ DEFAULTS = {
     "fallback": {
         "name": "Windows voice typing", "mode": "dictation",
         "activate": "ctrl+space", "send": "enter", "enabled": True,
-        # Cloud speech recognition, so the words land after the panel closes and
-        # a person waits to see them. See send_window_for.
-        "send_window_ms": 2500.0,
     },
 
     # --- lifecycle, for --follow ---
@@ -830,7 +827,9 @@ TERMINALS = frozenset({
 # Enter, and Enter is not a neutral key everywhere:
 #
 #   a terminal                 runs whatever is on the command line
-#   explorer.exe               handled separately, by title - see SHELL_WINDOWS
+#   explorer.exe               Enter opens whatever icon is selected, and the
+#                              desktop is the foreground window whenever
+#                              nothing else is
 #   consent.exe                the UAC prompt. Enter is Yes.
 #   LogonUI.exe,               the lock screen and the credential dialogs, where
 #   CredentialUIBroker         keystrokes go into a password box
@@ -842,37 +841,29 @@ TERMINALS = frozenset({
 #                              voice typing panel itself. This one is not a
 #                              window you dictate into, it IS the input UI
 #
-# The last four are their own processes, not explorer.exe windows, which is the
-# whole reason they are here rather than in SHELL_WINDOWS. Naming them by title
-# under explorer.exe was a real bug: the titles never matched, so the guard read
-# as covering them while the processes fell straight through to the catch-all.
-# Check the process before writing a title rule.
+# The last four are their own processes, not explorer.exe windows. Naming them
+# by title under explorer.exe was a real bug: the titles never matched, so the
+# guard read as covering them while the processes fell straight through to the
+# catch-all. Check the process before writing a title rule.
+#
+# explorer.exe was briefly split by title, so that folder windows got the
+# gesture and the desktop and the switcher did not. The user reported the
+# result as a bug on 2026-08-23: dictation turning itself on in the file
+# manager is not something anybody asked for, and the title split was three
+# code paths and a test matrix spent buying it. The whole process is refused
+# here now and the title rule is gone.
 #
 # Extend this rather than removing from it. An app wrongly left out gets no
 # dictation, which the log says plainly; an app wrongly let in gets a keystroke
 # nobody asked for.
 NEVER_FALLBACK = TERMINALS | frozenset({
+    "explorer.exe",
     "consent.exe", "logonui.exe", "credentialuibroker.exe",
     "taskmgr.exe", "lsass.exe", "winlogon.exe",
     "startmenuexperiencehost.exe", "searchhost.exe", "searchapp.exe",
     "shellexperiencehost.exe", "textinputhost.exe",
 })
 
-# explorer.exe is three different things wearing one image name, and only one of
-# them can be typed into. A folder window has a search box and a title naming
-# the folder. The desktop and the alt-tab switcher have no text field at all,
-# and the desktop is the foreground window whenever nothing else is - so Enter
-# there opens whichever icon happens to be selected. The taskbar has no title.
-#
-# Windows names the two that are not folders, and those names do not change
-# with the folder the user is in, so the title separates them cleanly. A folder
-# window is allowed; either of these, or a window with no title, is not.
-#
-# Only explorer.exe is checked against this. The Start menu, the search box and
-# the input panel look like shell windows but are separate processes, so they
-# are refused by name in NEVER_FALLBACK instead. Do not add a title here
-# without first confirming which process actually owns that window.
-SHELL_WINDOWS = frozenset({"program manager", "task switching"})
 
 
 def profiles_of(cfg):
@@ -891,24 +882,36 @@ def resolve_profile(exe, title, cfg):
     A profile matching is not permission to press anything. The caller still
     has to check enabled/activate, which is what keeps an app whose shortcut
     nobody has confirmed yet from receiving a guessed keystroke.
+
+    Naming a process in the table takes it away from the catch-all for good,
+    which is what `claimed` is for. Neither a title that failed to match nor a
+    profile with no key falls through - both return None and the snap is
+    ignored. The rule is that the catch-all is for processes nobody has an
+    opinion about, and writing a profile is an opinion.
+
+    Both other readings were shipped and both were reported as bugs on
+    2026-08-23. Falling through on a title miss meant that the moment the
+    ChatGPT app appended a project name to its window title, the anchored
+    "^Codex$" stopped matching and ctrl+space was pressed into Codex. Falling through on a parked
+    profile meant Antigravity IDE and VS Code - listed precisely because their
+    own dictation keys are unknown - collected 47 catch-all keystrokes in one
+    day. A profile with no key is a statement that this app is known and must
+    be left alone, not an invitation to guess.
+
+    The corollary is the escape hatch: to keep the catch-all out of any app,
+    add a profile naming its process with "enabled": false. No code change.
     """
     exe = (exe or "").lower()
+    claimed = False
     for prof in profiles_of(cfg):
         if prof.get("process", "").lower() != exe:
             continue
+        claimed = True
         pattern = prof.get("title")
         if pattern and not re.search(pattern, title or ""):
             continue
-        # A profile that cannot press anything must not block the catch-all.
-        # Antigravity IDE and VS Code are here precisely because their own
-        # dictation keys are wrong or missing, and a named profile with no key
-        # is a statement that this app has no shortcut of its own - which is
-        # the exact case the system-wide key exists to cover. First match still
-        # wins; this only decides whether the match can act.
-        if not profile_ready(prof):
-            break
         return prof
-    return fallback_profile(exe, title, cfg)
+    return None if claimed else fallback_profile(exe, title, cfg)
 
 
 def is_named_window(exe):
@@ -987,9 +990,6 @@ def fallback_profile(exe, title, cfg):
     if not prof or not prof.get("enabled") or not prof.get("activate"):
         return None
     if not is_named_window(exe) or exe in NEVER_FALLBACK:
-        return None
-    if exe == "explorer.exe" and (
-            not title or title.strip().lower() in SHELL_WINDOWS):
         return None
     return dict(prof, process=exe, name="%s [%s]" % (prof["name"], exe),
                 session=prof["name"])
@@ -2060,23 +2060,26 @@ def send_window_for(prof, cfg):
     gesture stays open - so the same number and the same per-profile override
     answer both.
 
-    One global number cannot fit both cases, and measurement says so.
+    This number is smaller than it looks, and an earlier version of this
+    comment made it carry weight it cannot hold. The argument then was that a
+    cloud dictation panel needs a wider window than a local one, because the
+    words arrive a beat after the panel closes; the catch-all was given 2500 ms
+    on that basis. A full day of snap.log says the app has nothing to do with
+    it. The gap between a stop and the next snap has the same shape in the
+    browser as in Claude desktop, and at every width from 0.75 to 4 seconds the
+    sends a wider window recovers and the deliberate restarts it destroys come
+    out equal - 15 against 19 for the browser, 19 against 19 for Claude. There
+    is no width that wins, because "I want to send this" and "I want to start
+    again" are the same gesture at the same speed.
 
-    An app that transcribes locally has the text on screen the moment dictation
-    stops, so the person snapping already knows what they are about to send and
-    750 ms is generous. Windows voice typing is cloud speech recognition: the
-    audio goes to a server and the words come back a beat after the panel
-    closes. A person waits to see them land before deciding to send, which is
-    the correct thing to do and also slower than 750 ms.
-
-    snap.log on 2026-08-23 has both halves. Every send that landed was snapped
-    inside the hold, at 88, 98 and 561 ms. Every one that did not was snapped 1
-    to 2 seconds after the stop, fell outside the global window, and was read as
-    "start dictating again" instead - so the panel reopened rather than the
-    message going out. That is the reported bug, and it is a units problem, not
-    a gate problem.
+    So the send does not depend on this window any more. resolve_pending holds
+    the stop open for the pair window and takes the confirming snap there,
+    where the pair itself is the evidence and no clock has to guess. What is
+    left for this number to do is close SETTLING afterwards, so that a snap
+    arriving much later reads as a fresh start.
 
     Set send_window_ms on a profile to override the global value for that app.
+    Nothing overrides it today. Reach for it only with a measurement.
     """
     return (prof or {}).get("send_window_ms") or cfg["send_window_ms"]
 
@@ -2246,6 +2249,31 @@ def resolve_pending(pending, det, cfg, dry_run, events, state, since,
     before = det.speech_db(pending["ev"]["onset_block"], -800, -100)
     was = "" if before is None else "  [before %.0f dB]" % before
     waited = (time.monotonic() - pending["at"]) * 1000.0
+    # Hold the stop until the pair window has closed, even when the room has
+    # already answered. This is the whole of the double snap that sends.
+    #
+    # The confirming snap of a natural double lands 76-989 ms after the first
+    # one; expect_pair has the measurement. The silence question can be
+    # answered at 300 ms, so releasing the moment it was answered pressed the
+    # stop while the second snap of the pair was still in the air. What
+    # happened to that snap then was a coin toss on timing: it arrived in
+    # SETTLING, where a 750 ms clock had already started running, and if it lost
+    # that race it read as "start dictating again" instead. snap.log on
+    # 2026-08-23 has the score - 141 stops in Claude desktop, 35 sends, 106
+    # restarts, and 55 of those restarts abandoned within three seconds because
+    # a send was what the user had asked for.
+    #
+    # Widening the SETTLING clock does not fix it and the same log says why: at
+    # every width from 0.75 to 4 seconds the sends recovered and the real
+    # restarts lost come out equal, because a deliberate restart and a late
+    # send are not separable by time. The pair is separable. Waiting for it
+    # here costs about 600 ms of extra recording and makes the send certain.
+    #
+    # A snap that already landed ends the wait, because there is nothing left
+    # to wait for. PENDING_TIMEOUT_MS still caps everything.
+    pair_ms = min(cfg["double_max_ms"], PENDING_TIMEOUT_MS)
+    if pending["follow"] is None and waited < pair_ms:
+        return state, since, pending
     if level is None and waited < PENDING_TIMEOUT_MS:
         return state, since, pending
 
@@ -2394,22 +2422,14 @@ def listen(cfg, dry_run, instance, watch, record=None):
         where = prof["process"] + (" [%s]" % prof["title"]
                                    if prof.get("title") else "")
         if not profile_ready(prof):
-            # It falls through to the catch-all rather than doing nothing, so
-            # saying "nothing sent" here would be false. Which of the two it is
-            # depends on whether the catch-all is on, so read it, do not assume.
-            fb = cfg.get("fallback") or {}
-            if fb.get("enabled") and fb.get("activate"):
-                # The mode shown is the catch-all's, not this profile's. What
-                # runs in that window is the catch-all whole, so printing the
-                # parked profile's mode here would promise a gesture nobody
-                # will get - a oneshot row that is really snap-on, snap-off.
-                print("    %-34s %-11s -> catch-all (%s)"
-                      % (where, fb.get("mode", "-"), fb["activate"]))
-            else:
-                why = ("no key yet" if not prof.get("activate")
-                       else "disabled: %s untested" % prof["activate"])
-                print("    %-34s %-11s -- nothing sent (%s)"
-                      % (where, prof["mode"], why))
+            # Nothing is sent here, and nothing falls through either. Naming
+            # a process in the table takes it away from the catch-all as well,
+            # so this row is the whole truth about that window. It used to say
+            # "-> catch-all", which was true for one commit and was the bug.
+            why = ("no key yet" if not prof.get("activate")
+                   else "disabled: %s untested" % prof["activate"])
+            print("    %-34s %-11s -- nothing sent (%s)"
+                  % (where, prof["mode"], why))
         elif prof["mode"] == "dictation":
             print("    %-34s %-11s snap %s on/off, snap twice -> %s"
                   % (where, prof["mode"], prof["activate"], prof["send"]))
@@ -2463,6 +2483,19 @@ def listen(cfg, dry_run, instance, watch, record=None):
             # The send window closes on its own, so that a snap a few seconds
             # after a stop reads as "start again" rather than "send".
             if state == SETTLING and held_ms > send_window_for(active, cfg):
+                # Logged, because for a long time it was not. classify has a
+                # branch that refuses a late send and names the numbers, and
+                # that branch is unreachable: this expiry always runs first, so
+                # the state was already IDLE by the time the snap arrived and
+                # the snap read as a fresh start. 2701 lines of snap.log
+                # contain the refusal message exactly zero times. A send that
+                # quietly turns into a restart is the single hardest thing in
+                # this program to diagnose from the log, so it says it now.
+                print("[%s] lapsed  %s send window closed after %.0f ms; the "
+                      "next snap starts again rather than sending"
+                      % (time.strftime("%H:%M:%S"),
+                         (active or {}).get("name", "the"),
+                         send_window_for(active, cfg)))
                 state, since = IDLE, now
                 held_ms = 0.0
             # An armed stop that never got its second snap lapses back to
@@ -2911,23 +2944,28 @@ def cmd_verify(cfg, config_path, as_json=False):
         note("OK" if not leaked else "FAIL", "the refusal list holds",
              "all %d refused" % len(NEVER_FALLBACK) if not leaked
              else "REACHES " + ", ".join(leaked))
-        # explorer.exe is allowed by process and refused by title, so the check
-        # that matters for it is a different one. A folder window can be typed
-        # into; the desktop, the switcher and the taskbar cannot.
-        shell = sorted(t for t in list(SHELL_WINDOWS) + [""]
-                       if fallback_profile("explorer.exe", t, cfg) is not None)
-        folder = fallback_profile("explorer.exe", "Downloads", cfg)
-        note("OK" if not shell and folder else "FAIL",
-             "explorer.exe is split by title",
-             "folder windows yes, %d shell windows no" % len(SHELL_WINDOWS)
-             if not shell and folder
-             else "REACHES " + ", ".join(repr(t) for t in shell))
+        # Every process the table names is the catch-all's business no longer,
+        # whatever the title says and whether or not the profile can press
+        # anything. Checked here because the two ways it used to leak - a title
+        # regex that missed, and a parked profile - both reached the user.
+        named = sorted({(p.get("process") or "").lower()
+                        for p in profiles_of(cfg) if p.get("process")})
+        leaked = sorted(e for e in named
+                        if resolve_profile(e, "any title at all", cfg) is not None
+                        and "voice typing" in resolve_profile(
+                            e, "any title at all", cfg)["name"])
+        note("OK" if not leaked else "FAIL",
+             "apps with a profile keep the catch-all out",
+             "all %d held" % len(named) if not leaked
+             else "REACHES " + ", ".join(leaked))
 
     if waiting:
-        note("OK" if on else "WARN", "profiles waiting to be configured",
-             "%s - no key of their own, %s"
-             % (", ".join(waiting),
-                "so they use the catch-all" if on else "and no catch-all is on"))
+        # Named and silent, which is the point of listing them. Naming a
+        # process here keeps the catch-all out of it as well, so these apps get
+        # nothing at all rather than the system-wide key.
+        note("OK", "profiles waiting to be configured",
+             "%s - no key of their own, and none guessed for them"
+             % ", ".join(waiting))
 
     # ---- the safety property ----------------------------------------------
     # ctrl+d is dictation in the Claude desktop app and end-of-input in every

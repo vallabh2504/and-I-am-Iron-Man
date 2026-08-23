@@ -178,13 +178,13 @@ What is wired out of the box:
 | Window | Matched by | Gesture | Sends |
 |---|---|---|---|
 | Claude desktop | `claude.exe` | snap on, snap off, snap twice submits | `ctrl+d`, then `enter` |
-| Codex | `chatgpt.exe` plus `^Codex$` | snap on, **snap twice** off | `ctrl+b`, then `ctrl+b` |
-| ChatGPT | `chatgpt.exe` plus `^ChatGPT$` | snap on, **snap twice** off | `ctrl+b`, then `ctrl+b` |
+| Codex | `chatgpt.exe` plus `^Codex` | snap on, **snap twice** off | `ctrl+b`, then `ctrl+b` |
+| ChatGPT | `chatgpt.exe` plus `^ChatGPT` | snap on, **snap twice** off | `ctrl+b`, then `ctrl+b` |
 | Antigravity | `antigravity.exe` | snap on, snap off, snap twice submits | `ctrl+m`, then `enter` |
-| Antigravity IDE | `antigravity ide.exe` | snap on, snap off, snap twice submits | `ctrl+space` through Windows, then `enter` |
-| VS Code | `code.exe` | snap on, snap off, snap twice submits | `ctrl+space` through Windows, then `enter` |
+| Antigravity IDE | `antigravity ide.exe` | none | nothing, deliberately |
+| VS Code | `code.exe` | none | nothing, deliberately |
 | Anything else | nothing claims it, so the catch-all does | snap on, snap off, snap twice submits | `ctrl+space` through Windows, then `enter` |
-| 21 named processes | terminals, the Start menu, search, UAC and password prompts | none | nothing, ever |
+| 22 named processes | terminals, Explorer, the Start menu, search, UAC and password prompts | none | nothing, ever |
 
 **Treat *Matched by* and *Sends* as this machine's answers, not yours.** The keys
 were the right ones for the app versions installed here on the day they were
@@ -249,7 +249,7 @@ send. A double snap presses Enter, and Enter is not a harmless key everywhere:
 | Window | What Enter does there |
 |---|---|
 | any terminal | runs whatever is on the command line |
-| the Windows desktop, which is `explorer.exe` | opens whichever icon happens to be selected, and the desktop is the foreground window whenever nothing else is |
+| `explorer.exe` | opens whichever icon happens to be selected, and the desktop is the foreground window whenever nothing else is |
 | `consent.exe` | the UAC prompt, where Enter is Yes |
 | `LogonUI.exe`, `CredentialUIBroker.exe` | the lock screen and credential dialogs, where keystrokes go into a password box |
 | `Taskmgr.exe` | End Task on whatever is selected |
@@ -258,9 +258,7 @@ send. A double snap presses Enter, and Enter is not a harmless key everywhere:
 | `ShellExperienceHost.exe` | activates whatever notification or shell surface is focused |
 | `TextInputHost.exe` | the emoji picker, the touch keyboard and the voice typing panel itself, which is input UI rather than somewhere to put input |
 
-Twenty-one processes are refused outright, and `explorer.exe` is refused by
-title rather than by process, for the reason under *Explorer is three windows
-wearing one name*. A window whose process cannot be
+Twenty-two processes are refused outright. A window whose process cannot be
 identified is refused as well, because a window that cannot be named cannot be
 vouched for, and "cannot be named" covers more than an empty string. When there
 is no foreground window at all, when the session is locked, or when the window
@@ -290,39 +288,54 @@ dictation". They are not the same question.
 To turn the whole thing off, set `"enabled": false` on the `fallback` block, or
 clear its `activate`. Either one silences every unwired app.
 
-### Explorer is three windows wearing one name
+### An app with a profile is never the catch-all's business
 
-`explorer.exe` is the file manager, and it is also the desktop, the alt-tab
-switcher and the taskbar. One image name, several windows, and only the file
-manager has anywhere to put text. A folder window has a search box and a title
-naming the folder. The desktop has no text field at all and is the foreground
-window whenever nothing else is, so an Enter there opens whichever icon happens
-to be selected.
+The catch-all is for processes nobody has an opinion about. Writing a profile is
+an opinion, so naming a process in the table takes it away from the catch-all
+for good. Not "unless the title fails to match", and not "unless the profile has
+no key" - for good.
 
-The title separates them, because Windows names the two that are not folders
-and those names do not change with the folder you are looking at:
+Both of the other readings shipped, and both were reported as bugs on 23 August
+2026, in the same message.
 
-| Title | What the catch-all does |
-|---|---|
-| `Downloads`, `Documents`, any folder name | allowed, and `ctrl+space` reaches the search box |
-| `Program Manager` | the desktop, refused |
-| `Task Switching` | alt-tab, refused |
-| empty | refused; the taskbar has no title, and neither does a window we cannot read |
+**A title that missed used to fall through.** The Codex profile matched
+`chatgpt.exe` with the anchored title `^Codex$`. The moment the ChatGPT desktop
+app appended a project name to its window, the regex missed, `chatgpt.exe` fell
+past the profile, and `ctrl+space` was pressed into Codex. The anchor is looser
+now (`^Codex`, so a suffix costs nothing) but that is the small half of the fix.
+The large half is that a miss no longer reaches the catch-all at all - the snap
+is ignored and the log says which window it was ignored in.
 
-That list is `SHELL_WINDOWS` in the source, and it holds those two titles only.
-`--verify` walks every entry against your live config rather than trusting that
-the code still matches this table.
+**A profile with no key used to fall through.** Antigravity IDE and VS Code are
+listed precisely because nobody has confirmed their dictation shortcut. That was
+read as "no shortcut of its own, so use the system one". `snap.log` counted 47
+catch-all keystrokes into `antigravity ide.exe` in a single day. A profile with
+no key is a statement that this app is known and must be left alone, not an
+invitation to guess one.
 
-**The Start menu, the search box, the notification surfaces and the emoji panel
-are not Explorer.** They look like shell windows and it is tempting to name them
-here, but each is its own process: `StartMenuExperienceHost.exe`,
+**The corollary is the escape hatch.** To keep the catch-all out of any app,
+give it a profile naming its process with `"enabled": false`. No code change:
+
+```json
+{"name": "Notepad", "process": "notepad.exe", "title": null,
+ "mode": "dictation", "activate": null, "send": null, "enabled": false}
+```
+
+**Explorer is refused outright now.** For one commit it was split by title, so
+that folder windows got the gesture and the desktop and the alt-tab switcher did
+not. Dictation turning itself on in the file manager is not something anybody
+asked for, and it was reported as a bug the same day it shipped. Enter in
+Explorer opens whichever icon is selected, which was always the stronger
+argument. The title rule is gone rather than left in place as a guard that no
+longer guards anything.
+
+**The Start menu, the search box and the input panel are not Explorer.** They
+look like shell windows and it is tempting to name them by title under
+`explorer.exe`. They are their own processes: `StartMenuExperienceHost.exe`,
 `SearchHost.exe`, `SearchApp.exe`, `ShellExperienceHost.exe` and
 `TextInputHost.exe`. Written as Explorer titles they would never match, so the
-guard would read as covering them while every one of them fell through to the
-catch-all. They are on the refusal list by process instead. Enter in the Start
-menu launches whatever is highlighted and Enter in the search box runs the top
-result, so this is not a cosmetic distinction. Confirm which process owns a
-window before writing a rule about it.
+guard would read as covering them while every one of them fell through. That
+happened. Check which process owns a window before writing a rule about it.
 
 ### What Windows voice typing actually is
 
@@ -353,30 +366,46 @@ behaviour, limits and all. What is worth knowing before you rely on it:
   controls the whole PC and works offline. If hands-free is the goal rather
   than dictation specifically, that is the one to go and read about.
 
-### Why the catch-all gets a wider send window
+### What actually makes a double snap send
 
-The cloud lag is what broke the send, and the log says so in numbers. Every
-double snap that landed was snapped *during* the stop gesture, at 88, 98 and
-561 ms. Every one that did not was snapped one to two seconds after the
-`dictation OFF` line, because the person was waiting to watch the words appear
-before submitting them. Those fell outside the 750 ms window, were read as
-"start dictating again", and reopened the panel instead of sending. The gate was
-working exactly as written. The number was wrong for this one app.
+The send used to be a race, and it lost most of the time. A full day of
+`snap.log` has the score: **141 stops in Claude desktop, 35 sends, 106 restarts,
+and 55 of those restarts abandoned within three seconds** because a send was
+what had been asked for. The message the user meant to submit stayed in the
+composer and the microphone opened again instead.
 
-So the window is per profile now. `send_window_ms` on a profile overrides the
-global value for that profile only:
+The obvious fix was to widen the window, and the same log says it does not work.
+Measured across every stop in the file, at each width, the sends a wider window
+recovers against the deliberate restarts it destroys:
 
-```json
-"fallback": {"name": "Windows voice typing", "mode": "dictation",
-             "activate": "ctrl+space", "send": "enter", "enabled": true,
-             "send_window_ms": 2500.0}
-```
+| window | sends recovered | real restarts turned into an unwanted Enter |
+|---|---|---|
+| 0.75 s | 0 | 0 |
+| 1.5 s | 11 | 9 |
+| 2.5 s | 19 | 19 |
+| 3.5 s | 23 | 30 |
 
-2500 ms is the cloud round trip plus the beat a person spends reading the
-result. An app whose dictation is local, Claude desktop being the one measured
-here, has no such lag and keeps the tighter global 750 ms, where a wider window
-would start reading casual pairs of snaps as sends. One number could not fit
-both, which is why there are now two.
+There is no width that wins, because "I want to send this" and "I want to start
+again" are the same gesture at the same speed. A clock cannot separate them.
+
+**The pair can.** Every send that ever worked came from a snap that arrived
+while the stop was still *held* - the beat between the snap and the keystroke
+during which the tool checks whether the room actually went quiet. That hold
+used to end the instant the question could be answered, about 300 ms in. A
+natural double snap lands 76 to 989 ms after the first, so the confirming snap
+was usually still in the air when the stop was pressed, and what happened to it
+afterwards depended on timing nobody controls.
+
+The hold now waits out the whole pair window before pressing the stop. A second
+snap inside it is the send, deterministically, with the pair itself as the
+evidence rather than a clock. It costs about 600 ms of extra recording, which is
+the cheapest thing in this document.
+
+`send_window_ms` still exists and still closes `SETTLING` afterwards, so a snap
+much later reads as a fresh start. It is one number for every app now. The
+per-profile override is still there for when a measurement asks for it; nothing
+uses it today, and the catch-all's old 2500 ms is gone, because the same table
+above says it was costing more restarts than it was buying sends.
 
 ### Why the title matters as well as the process
 
@@ -682,9 +711,9 @@ python snap_to_dictate.py --stop
 - **The send snap has to be quick.** Not "snap, then snap". One gesture, both
   snaps inside `send_window_ms`, which the shipped `config.json` sets to 750 ms.
   The built-in default is 1000 ms and applies only if you delete the key, and a
-  profile may carry its own value to override the global one. The catch-all
-  does, at 2500 ms, for the reason under *What Windows voice typing actually
-  is*.
+  profile may carry its own value to override the global one. Nothing does
+  today. What the send actually depends on is the held stop, under *What
+  actually makes a double snap send*.
   Measured double snaps here landed at 76 to 989 ms, and calibration sets the
   window from the 95th percentile rather than the slowest one, so the rare very
   slow pair falls outside it on purpose. The same person snapping twice
@@ -809,10 +838,16 @@ config rather than trusting either pair of numbers here.
 ```
 
 `SETTLING` is the only state this program invented. Dictation is already off.
-What is being decided is whether to submit. It lasts `send_window_ms`, which is
-750 ms in the shipped `config.json` and 2500 ms under the catch-all, and then
-lapses back to `IDLE` on its own,
-so a snap a few seconds after a stop reads as "start again" rather than "send".
+What is being decided is whether to submit. It lasts `send_window_ms`, 750 ms
+in the shipped `config.json`, and then lapses back to `IDLE` on its own, so a
+snap a few seconds after a stop reads as "start again" rather than "send". The
+lapse is announced in the log. For a long time it was not, and a send that
+quietly turned into a restart was the hardest thing in this program to diagnose
+after the fact.
+
+By the time a snap reaches `SETTLING` the send has usually already been decided
+one step earlier, in the held stop - see *What actually makes a double snap
+send*.
 
 The app shows and sounds dictation starting and stopping, so those two states
 need no help from here. `SETTLING` shows nothing, which is a real gap. An

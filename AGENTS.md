@@ -204,14 +204,14 @@ two multiples of 5.805 behaves exactly like the lower one.
 microphone
     │  256-sample blocks
     ▼
-SnapDetector.push()                  snap_to_dictate.py:270
+SnapDetector.push()                  snap_to_dictate.py:267
     │  per-block rFFT, high band 1500-16000 Hz vs an EMA noise floor
     │  ONSET gates  ─► VERIFY gates ─► one event with five features
     ▼
 event {peak_db, onset_hf, tail_hf, decay_ms, attack_ms, crest}
     │
     ▼
-TriggerGate.offer()                  snap_to_dictate.py:560
+TriggerGate.offer()                  snap_to_dictate.py:557
     │  refractory, single-vs-double pairing, the send window
     ▼
 listen() state machine               IDLE / RECORDING / SETTLING
@@ -229,13 +229,14 @@ counting the wrong thing. The event is the unit.
 
 | You want to change | Go to |
 |---|---|
-| what counts as a snap | `SnapDetector` gates, `snap_to_dictate.py:270` |
-| single vs double, pairing windows | `TriggerGate`, `snap_to_dictate.py:560` |
-| which key goes to which app | `resolve_profile`, `snap_to_dictate.py:882` |
-| what an app with no profile gets | `fallback_profile`, `snap_to_dictate.py:961` |
-| which windows are never typed into | `is_named_window` and `NEVER_FALLBACK`, `snap_to_dictate.py:914` |
-| which dictation a snap belongs to | `session_of`, `snap_to_dictate.py:939` |
+| what counts as a snap | `SnapDetector` gates, `snap_to_dictate.py:267` |
+| single vs double, pairing windows | `TriggerGate`, `snap_to_dictate.py:557` |
+| which key goes to which app | `resolve_profile`, `snap_to_dictate.py:873` |
+| what an app with no profile gets | `fallback_profile`, `snap_to_dictate.py:964` |
+| which windows are never typed into | `is_named_window` and `NEVER_FALLBACK`, `snap_to_dictate.py:917` |
+| which dictation a snap belongs to | `session_of`, `snap_to_dictate.py:942` |
 | how long a send stays possible, per app | `send_window_for`, `snap_to_dictate.py:2055` |
+| how long a held stop waits for its pair | `resolve_pending`, `snap_to_dictate.py:2213` |
 | the dictation on/off/submit flow | `listen()` and `resolve_pending` |
 | what calibration measures | `CAL_PASSES` and `derive()`, and CALIBRATION.md with it |
 | install checks | `cmd_verify`, `snap_to_dictate.py` |
@@ -284,14 +285,15 @@ only the anchored title `^Codex$` separates them. For the same reason, all focus
 comparisons elsewhere in the program are done by **profile name, never by
 process**, because two profiles can share an executable.
 
-A disabled profile with `"activate": null` is a legitimate placeholder. The app
-is wired up and waiting for somebody to find its dictation shortcut. It does not
-sit idle: as of the catch-all below it falls through to Windows' own dictation
-instead, and `--verify` says so.
+A disabled profile with `"activate": null` is a legitimate placeholder, and it
+is also the opt-out. The app is named, so nothing is guessed for it: it gets no
+key of its own and the catch-all below is kept out of it too. `--verify` lists
+these under *profiles waiting to be configured*. To keep the catch-all out of
+any app without touching code, give it one of these.
 
 ### The catch-all
 
-`fallback_profile` (`snap_to_dictate.py:961`) builds a profile on the spot for
+`fallback_profile` (`snap_to_dictate.py:964`) builds a profile on the spot for
 any window that no entry in `profiles` claimed. It ships enabled, so an app
 nobody wired up behaves like one that was, using Windows' own voice typing.
 
@@ -301,8 +303,7 @@ nobody wired up behaves like one that was, using Windows' own voice typing.
   "mode": "dictation",
   "activate": "ctrl+space",
   "send": "enter",
-  "enabled": true,
-  "send_window_ms": 2500.0
+  "enabled": true
 }
 ```
 
@@ -310,8 +311,9 @@ The fields mean what they mean in a profile. There is no `process` or `title`,
 because not matching is the point. Everything below is load-bearing rather than
 cosmetic, and each part has tests.
 
-**It refuses 21 processes and every window it cannot identify.**
-`NEVER_FALLBACK` is the `TERMINALS` list plus eleven more: `consent.exe`,
+**It refuses 22 processes and every window it cannot identify.**
+`NEVER_FALLBACK` is the `TERMINALS` list plus twelve more: `explorer.exe`,
+`consent.exe`,
 `logonui.exe`, `credentialuibroker.exe`, `taskmgr.exe`, `lsass.exe`,
 `winlogon.exe`, `startmenuexperiencehost.exe`, `searchhost.exe`,
 `searchapp.exe`, `shellexperiencehost.exe` and `textinputhost.exe`. Terminals
@@ -332,30 +334,24 @@ error 5 crashes below. `--verify` re-derives the whole
 refusal by calling `fallback_profile` on every name in the list, so it checks
 the refusal instead of trusting it. **Add to this list. Do not cut from it.**
 
-**`explorer.exe` is refused by title, not by process.** It used to sit on
-`NEVER_FALLBACK`, and that cost the user the file manager, which is the one
-place where a search box makes the gesture obviously worth having. One image
-name covers a folder window, the desktop, the alt-tab switcher and the taskbar.
-Only the folder window can be typed into, and only the desktop is
-dangerous, because it is the foreground window whenever nothing else is and
-`enter` there opens whichever icon is selected. Windows names the two that are
-not folders, and those names do not move with the folder the user is in, so the
-title separates them cleanly. `SHELL_WINDOWS` holds `program manager` and `task
-switching`; `fallback_profile` matches the title lowercased and stripped, and
-refuses an empty title as well, because the taskbar has none and neither does a
-window whose title could not be read. `--verify` and the test suite both walk
-the whole set.
+**`explorer.exe` is refused outright.** For exactly one commit it was split by
+title, so that folder windows got the gesture and the desktop and the alt-tab
+switcher did not. The user reported the result as a bug the same day: dictation
+turning itself on in the file manager is not something anybody asked for, and
+`enter` on the desktop opens whichever icon is selected, which was always the
+stronger argument. `SHELL_WINDOWS` and the title branch are deleted rather than
+left in place, because a guard that no longer guards anything is worse than no
+guard at all - see the next paragraph for how that failure looks.
 
-**`SHELL_WINDOWS` is consulted for `explorer.exe` and nothing else, so a title
-in it that belongs to another process is dead weight that reads as a guard.**
-That happened. `start`, `search`, `windows shell experience host` and `windows
-input experience` were written here first, and every one of them is a separate
-process: `StartMenuExperienceHost.exe`, `SearchHost.exe`,
+**The Start menu, the search box, the shell surfaces and the input panel are
+not Explorer.** `start`, `search`, `windows shell experience host` and `windows
+input experience` were once written as `explorer.exe` titles, and every one of
+them is a separate process: `StartMenuExperienceHost.exe`, `SearchHost.exe`,
 `ShellExperienceHost.exe`, `TextInputHost.exe`. The titles never matched under
-`explorer.exe`, so the four windows they were meant to stop went straight to the
-catch-all while the code read as though they were covered. They are on
-`NEVER_FALLBACK` by process now, with a test per name. Confirm which process
-owns a window before you write a title rule about it.
+`explorer.exe`, so all four windows went straight to the catch-all while the
+code read as though they were covered. They are on `NEVER_FALLBACK` by process
+now, with a test per name. Confirm which process owns a window before you write
+a title rule about it.
 
 **Each window gets its own profile name**, `Windows voice typing [chrome.exe]`.
 `send_key_if_focused` re-checks focus by comparing profile **names**, and that
@@ -373,13 +369,41 @@ open, which closes it. Everything after that is inverted. Keep the two
 questions apart: the **name** answers may this keystroke land in this window,
 the **session** answers is this the same dictation.
 
-**A profile that cannot press anything falls through to it.** `resolve_profile`
-breaks out of its loop when the matched profile fails `profile_ready()`, rather
-than returning it, so the parked `Antigravity IDE` and `VS Code` entries now
-work through Windows. Two consequences. Enabling a parked profile changes
-*which* key is sent, not *whether* one is; and what runs in that window is the
-catch-all whole, including its `mode`, so a parked `oneshot` profile still gives
-the snap-on, snap-off, double-snap-to-send gesture.
+**A process named anywhere in `profiles` is never the catch-all's business.**
+`resolve_profile` sets `claimed` the moment the image name matches an entry, and
+a claimed process returns either that profile or `None` - never the fallback.
+Neither a title regex that missed nor a profile with no key falls through.
+
+Both other readings shipped, and both were reported as bugs on 23 August 2026 in
+one message. Falling through on a title miss meant that when the ChatGPT desktop
+app appended a project name to its window, the anchored `^Codex$` stopped
+matching and `ctrl+space` was pressed into Codex; the pattern is looser now, but
+that is the small half of the fix. Falling through on a parked profile meant
+`Antigravity IDE` and `VS Code` - listed precisely because nobody has confirmed
+their dictation shortcut - collected 47 catch-all keystrokes into
+`antigravity ide.exe` in one day.
+
+The rule to keep: the catch-all is for processes nobody has an opinion about,
+and writing a profile is an opinion.
+
+**The double snap that sends.** Every send that has ever worked came from a
+snap arriving while the stop was still held in `resolve_pending`, not from the
+`SETTLING` clock. The hold used to end the instant `speech_db` could answer the
+silence question, about 300 ms in; a natural double snap lands 76 to 989 ms
+after the first, so the confirming snap was usually still in the air when the
+stop was pressed. `snap.log` on 23 August 2026: 141 stops in Claude desktop, 35
+sends, 106 restarts, 55 of those restarts abandoned within three seconds.
+
+The hold now waits `min(cfg["double_max_ms"], PENDING_TIMEOUT_MS)` before
+pressing the stop, unless a confirming snap has already landed, in which case
+there is nothing left to wait for. A snap inside the hold becomes
+`pending["follow"]` and the send is certain. The cost is about 600 ms of extra
+recording.
+
+`classify`'s `SETTLING` refusal branch is unreachable from `listen()`: the
+expiry in the main loop always fires first, which is why 2701 lines of log
+contain its message zero times. The expiry prints its own line now. Keep the
+`classify` branch - `cmd_replay` and the test suite both call it directly.
 
 **The detector is touched by two threads, and exactly one structure needs a
 lock.** `push` runs on the PortAudio callback thread; `speech_db` iterates
@@ -404,19 +428,19 @@ paths. Callers treat False as "the app was not touched" and leave state where
 it was, so a refused start does not put the loop into `RECORDING` waiting to
 stop a dictation that never began.
 
-**Its send window is its own, and wider.** A profile may carry its own
-`send_window_ms`; `send_window_for` (`snap_to_dictate.py:2055`) returns that
-when it is set and the global value otherwise, and `classify` now takes the
-profile so `SETTLING` can ask. The catch-all sets 2500 ms against a global 750 ms, because
-Windows voice typing is cloud recognition: the audio goes to Microsoft, the
-words come back a beat later, and a person waits to watch them land before
-deciding to submit. The log holds both halves. Every send that landed was
-snapped inside the stop gesture, at 88, 98 and 561 ms; every send that did not
-was snapped one to two seconds after `dictation OFF`, fell outside 750 ms, and
-was read as "start dictating again", which pressed `ctrl+space` and reopened the
-panel instead. Nothing was wrong with the gate. One global number could not fit
-a local dictation and a cloud one at once. Do not widen the global value to fix
-one app; give that app its own.
+**Its send window is the same as everybody's.** It briefly carried 2500 ms
+against a global 750 ms, on the theory that cloud recognition needs longer than a
+local transcript. A full day of `snap.log` killed the theory. The gap between a
+stop and the next snap has the same shape in the browser as in Claude desktop,
+and at every width from 0.75 to 4 seconds the sends a wider window recovers and
+the deliberate restarts it destroys come out equal - 15 against 19 for the
+browser, 19 against 19 for Claude. There is no width that wins, because "send
+this" and "start again" are the same gesture at the same speed.
+
+`send_window_for` (`snap_to_dictate.py:2055`) still exists and a profile may
+still carry `send_window_ms`; nothing does today. Reach for it only with a
+measurement in hand. What the send actually depends on is the held stop - see
+**The double snap that sends** below.
 
 Set `"enabled": false` on `fallback`, or its `activate` to `null`, and every
 window without a profile of its own goes back to being ignored.

@@ -567,7 +567,7 @@ check("...in both directions",
 # editor.
 check("an editor open on a folder named CODEX is not Codex",
       (route("antigravity ide.exe", "CODEX - Antigravity IDE") or {}).get("name"),
-      None)
+      "Antigravity IDE")
 check("...and is still not Codex once a catch-all exists",
       "Codex" in (route_all("antigravity ide.exe",
                             "CODEX - Antigravity IDE") or {}).get("name", ""),
@@ -586,11 +586,15 @@ check("a terminal matches no profile",
 check("only apps with a confirmed shortcut may send",
       [p["name"] for p in DEFAULTS["profiles"] if profile_ready(p)],
       ["Claude desktop", "Codex", "ChatGPT", "Antigravity"])
-check("an app whose own shortcut is unknown gets nothing on its own",
-      route("code.exe", "x - Visual Studio Code"), None)
-check("...and reaches the system-wide key instead when one is configured",
-      (route_all("code.exe", "x - Visual Studio Code") or {}).get("activate"),
-      "ctrl+space")
+check("an app whose own shortcut is unknown still presses nothing",
+      profile_ready(route("code.exe", "x - Visual Studio Code")), False)
+# ...and it does not quietly become the catch-all's problem either. Listing an
+# app with no key is a statement that this app is known and must be left alone.
+# Reading it as "no shortcut of its own, so use the system one" put 47
+# ctrl+space presses into antigravity ide.exe on 2026-08-23.
+check("...and does not fall through to the system-wide key",
+      "voice typing" in (route_all("code.exe", "x - Visual Studio Code")
+                         or {}).get("name", ""), False)
 
 # The two Antigravity programs are separate installs with separate
 # executables, and only the desktop app is wired. Matching is on the whole
@@ -1014,8 +1018,6 @@ check("the stop-gesture count is what the document asks for",
 # checks are that list. The send is what makes it dangerous: a double snap
 # presses Enter, and Enter runs the command line in a shell, opens the selected
 # icon on the desktop, and answers Yes on a UAC prompt.
-check("explorer.exe is no longer refused by process alone",
-      "explorer.exe" in _s.NEVER_FALLBACK, False)
 for _exe in sorted(_s.NEVER_FALLBACK):
     check("the catch-all refuses %s" % _exe, route_all(_exe), None)
 
@@ -1061,71 +1063,146 @@ check("...and does not share it with the catch-all",
 check("the focus-moved reset compares sessions, not names",
       "session_of(prof) != session_of(active)" in _src, True)
 
-# ...unless the app it belongs to says otherwise. Windows voice typing is cloud
-# speech recognition: the words arrive after the panel closes, and a person
-# waits to see them before deciding to send. Every send that failed in snap.log
-# on 2026-08-23 was snapped 1 to 2 seconds after the stop and read as "start
-# dictating again" instead, which reopened the panel rather than sending.
-_CATCH = dict(DEFAULTS["fallback"])
-check("the global send window is the tighter one",
-      _s.send_window_for(None, live), live["send_window_ms"])
-check("the catch-all gets a wider one, for the cloud round trip",
-      _s.send_window_for(_CATCH, live) > live["send_window_ms"], True)
-check("a named profile does not, because its transcript is already local",
-      _s.send_window_for(next(p for p in DEFAULTS["profiles"]
-                              if p["name"] == "Claude desktop"), live),
-      live["send_window_ms"])
-check("...so the same late snap does send in Windows voice typing",
-      classify(SETTLING, event(GOOD, 500), 1400.0, live, strict, start_gate,
-               _CATCH)[0], "send")
-check("...but not one later than even that window",
-      classify(SETTLING, event(GOOD, 700), 9000.0, live, strict, start_gate,
-               _CATCH)[0], None)
-check("...and the shape gate still applies inside the wider window",
-      classify(SETTLING, event(DULL, 500), 1400.0, live, strict, start_gate,
-               _CATCH)[0], None)
-
-# The expiry inside listen() has to read the same number, or the state would be
-# thrown away before the snap that classify would have accepted ever arrives.
-check("the settling expiry asks the profile too, not the global config",
+# --- what actually makes a double snap send ----------------------------------
+# The catch-all used to carry send_window_ms 2500, on the theory that cloud
+# speech recognition needs longer than a local transcript does. A full day of
+# snap.log killed the theory: the gap between a stop and the next snap has the
+# same shape in both, and at every width from 0.75 to 4 seconds the sends a
+# wider window recovers and the deliberate restarts it destroys come out equal
+# (15 against 19 in the browser, 19 against 19 in Claude desktop). No width
+# wins, so there is no override any more.
+check("one measured number covers every app",
+      sorted({_s.send_window_for(p, live)
+              for p in list(DEFAULTS["profiles"]) + [DEFAULTS["fallback"], None]}),
+      [live["send_window_ms"]])
+check("the per-profile override still works, for when a measurement asks",
+      _s.send_window_for({"send_window_ms": 4321.0}, live), 4321.0)
+check("...and the settling expiry asks the profile, not the global config",
       "send_window_for(active, cfg)" in _src, True)
+
+# The send itself no longer races that clock. Every send that ever worked in
+# snap.log came from a snap arriving while the stop was still HELD, and the
+# hold used to end the instant the silence question could be answered, about
+# 300 ms in. A natural double snap lands 76-989 ms after the first, so the
+# confirming snap was usually still in the air when the stop was pressed. 141
+# stops in Claude desktop produced 35 sends and 106 restarts, and 55 of those
+# restarts were abandoned within three seconds because a send was what had been
+# asked for. The hold waits out the pair window now.
+import queue as _q
+import time as _tm
+
+
+class _QuietRoom:
+    """A detector stub that answers the silence question at once, and quietly."""
+
+    def speech_db(self, onset_block, lo_ms, hi_ms):
+        return 0.0
+
+
+def _held(age_ms, follow=None):
+    return {"ev": {"onset_block": 10}, "detail": "held stop",
+            "prof": dict(DEFAULTS["profiles"][0]),
+            "keys": ((), 0x44, (), 0x0D), "follow": follow,
+            "at": _tm.monotonic() - age_ms / 1000.0}
+
+
+def _resolve(pending):
+    return _s.resolve_pending(pending, _QuietRoom(), live, True, _q.Queue(),
+                              RECORDING, _tm.monotonic(), start_gate)
+
+
+_state, _, _rest = _resolve(_held(0.0))
+check("a stop stays held while the pair window is still open",
+      (_state, _rest is None), (RECORDING, False))
+_state, _, _rest = _resolve(_held(live["double_max_ms"] + 50.0))
+check("...and is released once that window closes", (_state, _rest),
+      (SETTLING, None))
+_state, _, _rest = _resolve(_held(0.0, follow=event(GOOD, 20)))
+check("...or at once when the confirming snap has already landed",
+      (_state, _rest), (IDLE, None))
+check("the hold can never outlast the pending timeout",
+      live["double_max_ms"] <= _s.PENDING_TIMEOUT_MS, True)
+check("the pair window is what the hold waits for, not a number of its own",
+      'min(cfg["double_max_ms"], PENDING_TIMEOUT_MS)' in _src, True)
+
+# classify still refuses a late send, and that branch is now unreachable from
+# listen(): the expiry above always fires first. 2701 lines of snap.log contain
+# its message exactly zero times, which is why the expiry prints one of its
+# own. The branch stays tested because classify is also called straight from
+# this file and from cmd_replay.
+check("a snap long after a stop is still not a send",
+      classify(SETTLING, event(GOOD, 700), 9000.0, live, strict, start_gate,
+               None)[0], None)
+check("...and the shape gate still guards the ones inside the window",
+      classify(SETTLING, event(DULL, 500), 100.0, live, strict, start_gate,
+               None)[0], None)
+check("the expiry says so in the log rather than closing silently",
+      "send window closed after" in _src, True)
+
 check("every terminal is inside the refusal list",
       _s.TERMINALS <= _s.NEVER_FALLBACK, True)
-# explorer.exe used to be refused outright, which also refused the folder
-# windows the user actually wanted to dictate into. It is split by title now:
-# a folder window has a search box, the desktop and the switcher do not, and
-# Enter on the desktop opens whichever icon happens to be selected.
-check("the desktop is refused, because Enter opens what is selected",
-      route_all("explorer.exe", "Program Manager"), None)
-check("...and so is the alt-tab switcher",
-      route_all("explorer.exe", "Task Switching"), None)
-check("...and so is an explorer window with no title at all",
-      route_all("explorer.exe", ""), None)
-for _t in sorted(_s.SHELL_WINDOWS):
-    check("...and so is %r" % _t, route_all("explorer.exe", _t), None)
-    check("...whatever its case", route_all("explorer.exe", _t.title()), None)
-check("a folder window is allowed, so its search box can be dictated into",
-      (route_all("explorer.exe", "Downloads") or {}).get("activate"),
-      "ctrl+space")
-check("...and carries explorer.exe in its name like any other unwired app",
-      "explorer.exe" in route_all("explorer.exe", "Downloads")["name"], True)
+# --- 2026-08-23: the three routing bugs reported in one message --------------
+# All of them were one rule not being written down. The catch-all is for
+# processes nobody has an opinion about, and writing a profile is an opinion.
 
-# The Start menu, the search box, the notification surfaces and the input panel
-# look like shell windows and were briefly written as explorer.exe titles. They
-# are separate processes, so those titles never matched and the guard covered
-# nothing while reading as though it did. They are refused by process now, and
-# each is checked by name so the mistake cannot come back quietly.
-for _p in ("startmenuexperiencehost.exe", "searchhost.exe", "searchapp.exe",
-           "shellexperiencehost.exe", "textinputhost.exe"):
-    check("%s is refused by process, not by title" % _p, route_all(_p, ""), None)
-    check("...whatever title it carries", route_all(_p, "Windows Input Experience"),
-          None)
-    check("...and it is on the refusal list itself", _p in _s.NEVER_FALLBACK, True)
-# The corollary: SHELL_WINDOWS is only ever consulted for explorer.exe, so a
-# title in it that belongs to some other process is dead weight that reads as a
-# guard. Every entry has to be a window explorer.exe actually owns.
-check("SHELL_WINDOWS holds only titles explorer.exe really owns",
-      set(_s.SHELL_WINDOWS), {"program manager", "task switching"})
+# Explorer folder windows were given the gesture on purpose one commit earlier,
+# and the user reported the result as a bug the same day: dictation turning
+# itself on in the file manager is not something anybody asked for. Enter there
+# opens whichever icon is selected, which was always the stronger argument.
+check("explorer.exe is refused by process again",
+      "explorer.exe" in _s.NEVER_FALLBACK, True)
+for _t in ("Downloads", "Program Manager", "Task Switching", "C:", ""):
+    check("...whatever the window is called: %r" % _t,
+          route_all("explorer.exe", _t), None)
+check("the title split is gone, not left behind as a dead guard",
+      hasattr(_s, "SHELL_WINDOWS"), False)
+
+# The ChatGPT desktop app titles its window "Codex", and the profile anchored
+# on exactly that. The moment a project name was appended the regex missed, the
+# process fell through, and ctrl+space went into Codex.
+for _t in ("Codex - snap-to-dictate", "ChatGPT - a chat name", "",
+           "something nobody anticipated"):
+    _r = route_all("chatgpt.exe", _t)
+    check("a title miss never hands chatgpt.exe to the catch-all: %r" % _t,
+          _r is None or "voice typing" not in _r["name"], True)
+check("...while the title that does match still routes",
+      route_all("chatgpt.exe", "Codex")["name"], "Codex")
+check("...and a suffix on it no longer costs the match",
+      route_all("chatgpt.exe", "Codex - snap-to-dictate")["name"], "Codex")
+check("...but CODEX inside a chat title is still not the Codex window",
+      route_all("chatgpt.exe", "CODEX explained"), None)
+
+# Antigravity IDE and VS Code carry no key precisely because nobody has
+# confirmed their dictation shortcut. That was read as "no shortcut of its own,
+# so use the system one", and snap.log counted 47 catch-all keystrokes into
+# antigravity ide.exe in a single day.
+for _p in ("antigravity ide.exe", "code.exe"):
+    _r = route_all(_p, "main.py")
+    check("a parked profile keeps the catch-all out of %s" % _p,
+          _r is not None and "voice typing" not in _r["name"], True)
+    check("...and is still returned by name, so the log can say why",
+          profile_ready(_r), False)
+
+# The rule itself, swept over the whole table rather than app by app, so a
+# profile added later is covered the day it is added.
+for _p in sorted({(p.get("process") or "").lower()
+                  for p in DEFAULTS["profiles"] if p.get("process")}):
+    for _t in ("", "a title nobody anticipated", "Codex", "Claude"):
+        _r = route_all(_p, _t)
+        check("%s is never the catch-all business (%r)" % (_p, _t),
+              _r is None or "voice typing" not in _r["name"], True)
+
+# And the escape hatch that rule buys: naming a process with the profile turned
+# off is how a user keeps the catch-all out of an app without touching code.
+_OPTOUT = {"profiles": list(DEFAULTS["profiles"]) + [
+    {"name": "Notepad", "process": "notepad.exe", "title": None,
+     "mode": "dictation", "activate": None, "send": None, "enabled": False}],
+    "fallback": DEFAULTS["fallback"]}
+check("an unwired app gets the system key",
+      route_all("notepad.exe", "Untitled")["activate"], "ctrl+space")
+check("...and a disabled profile naming it takes that away, with no code change",
+      "voice typing" in (resolve_profile("notepad.exe", "Untitled",
+                                         _OPTOUT) or {}).get("name", ""), False)
 
 # An app that IS wired keeps its own key. The catch-all is a last resort, not
 # an override, or a snap in Claude would press the system key instead of ctrl+d.
@@ -1142,16 +1219,14 @@ check("each unwired app resolves under its own name",
 check("...and the name says which app it was",
       "chrome.exe" in route_all("chrome.exe")["name"], True)
 
-# A parked profile is oneshot; the catch-all is dictation. What runs in that
-# window is the catch-all whole, so the mode has to come from it too. Reading
-# the mode off the parked profile would promise a gesture nobody gets.
-check("a parked profile falls through with the catch-all's mode",
-      route_all("code.exe", "x - Visual Studio Code")["mode"], "dictation")
-check("...and the profile it fell through from was not itself dictation",
-      [p["mode"] for p in DEFAULTS["profiles"]
-       if p["process"] == "code.exe"], ["oneshot"])
-check("the startup banner reports the catch-all's mode, not the parked one",
-      'prof["mode"], fb["activate"]' in _src, False)
+# A parked profile does not fall through at all any more, so the question of
+# whose mode it would carry does not arise. What is left to check is that the
+# window still resolves to something with a name, because that name is how the
+# log explains the silence: "VS Code matched but no activate key set".
+check("a parked profile still resolves, so the log can name it",
+      route_all("code.exe", "x - Visual Studio Code")["name"], "VS Code")
+check("...and it presses nothing",
+      profile_ready(route_all("code.exe", "x - Visual Studio Code")), False)
 
 # Turning it off has to actually turn it off.
 check("disabling the catch-all silences every unwired app",
