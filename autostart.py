@@ -14,7 +14,7 @@ Letting a race happen and lose costs one short-lived process; a lock file checke
 here would instead have to be second-guessed for staleness every time.
 
 That tolerance is what lets the scheduled task double as a watchdog. The task
-carries two triggers: one at logon, and one that repeats every five minutes
+carries two triggers: one at logon, and one that repeats every two minutes
 forever. The repeating one runs this launcher over and over against a listener
 that is usually already alive, which costs a Python startup and nothing else,
 and matters on the run where the listener is gone.

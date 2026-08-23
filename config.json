@@ -57,7 +57,7 @@
       "name": "Codex",
       "process": "chatgpt.exe",
       "title": "^Codex$",
-      "mode": "oneshot",
+      "mode": "converse",
       "activate": "ctrl+b",
       "send": null,
       "enabled": true
@@ -66,7 +66,7 @@
       "name": "ChatGPT",
       "process": "chatgpt.exe",
       "title": "^ChatGPT$",
-      "mode": "oneshot",
+      "mode": "converse",
       "activate": "ctrl+b",
       "send": null,
       "enabled": true

@@ -39,6 +39,7 @@ import json
 import queue
 import re
 import sys
+import threading
 import wave
 import time
 from ctypes import wintypes
@@ -148,6 +149,14 @@ DEFAULTS = {
     # mode "oneshot": one snap presses "activate" and that is the whole
     #   gesture. For a voice agent that listens and replies on its own there is
     #   nothing to stop and nothing to submit.
+    # mode "converse": one snap presses "activate" to begin, and a DOUBLE snap
+    #   presses the same key again to end. For an app whose voice mode is a
+    #   toggle on one key, which is what makes oneshot dangerous there: every
+    #   false positive after the first snap ends a conversation the user is in
+    #   the middle of. Requiring a pair to stop costs one extra snap and makes
+    #   an accidental stop about as likely as an accidental double snap, which
+    #   measurement puts near zero. Nothing is pressed by the first snap of the
+    #   pair, so a lone false positive touches the app not at all.
     #
     # A profile with "activate": null, or "enabled": false, NEVER sends
     # anything - it logs what it would have done. Unknown shortcuts stay unset
@@ -175,10 +184,10 @@ DEFAULTS = {
         # profile to {"mode": "dictation", "activate": "ctrl+m",
         # "send": "enter"} if the typed transcript is what is wanted here.
         {"name": "Codex", "process": "chatgpt.exe", "title": "^Codex$",
-         "mode": "oneshot", "activate": "ctrl+b", "send": None,
+         "mode": "converse", "activate": "ctrl+b", "send": None,
          "enabled": True},
         {"name": "ChatGPT", "process": "chatgpt.exe", "title": "^ChatGPT$",
-         "mode": "oneshot", "activate": "ctrl+b", "send": None,
+         "mode": "converse", "activate": "ctrl+b", "send": None,
          "enabled": True},
 
         # The Antigravity desktop app. Note this is NOT the same program as
@@ -302,6 +311,16 @@ class SnapDetector:
         # Speech-band history, long enough to look a little way past any event.
         # Keyed by block index so a measurement can be aligned to an onset that
         # has already scrolled by.
+        #
+        # This is the one structure in the class that two threads touch. push()
+        # appends from the PortAudio callback thread; speech_db() iterates from
+        # the main loop while resolving a held stop. A deque raises RuntimeError
+        # if it is mutated mid-iteration, and it killed the listener at 15:09:19
+        # on 2026-08-23 with "deque mutated during iteration" straight out of
+        # the list comprehension in speech_db. The lock is held for one append
+        # on the audio side and one comprehension over at most 300 pairs on the
+        # read side, so the callback is never blocked for a meaningful time.
+        self.speech_lock = threading.Lock()
         self.speech_hist = collections.deque(maxlen=SPEECH_HISTORY_BLOCKS)
         self.speech_floor = None
         self.speech_warmup = []
@@ -357,15 +376,19 @@ class SnapDetector:
         no longer reaches back to the onset, so a stale question gets no answer
         instead of a wrong one.
         """
-        if self.speech_floor is None or not self.speech_hist:
+        if self.speech_floor is None:
             return None
         first = onset_block + int(round(lo_ms / self.block_ms))
         last = onset_block + int(round(hi_ms / self.block_ms))
         if self.block_index < last:
             return None
-        if self.speech_hist[0][0] > first:
-            return None
-        vals = [v for b, v in self.speech_hist if first <= b <= last]
+        # Every read of speech_hist happens inside the lock, including the two
+        # emptiness and range checks, so the answer cannot be assembled from
+        # two different versions of the history.
+        with self.speech_lock:
+            if not self.speech_hist or self.speech_hist[0][0] > first:
+                return None
+            vals = [v for b, v in self.speech_hist if first <= b <= last]
         if not vals:
             return None
         return db(float(np.mean(vals))) - db(self.speech_floor)
@@ -464,11 +487,16 @@ class SnapDetector:
         self.cooldown = min(self.cooldown, self.pair_refractory_blocks)
 
     def push(self, block):
+        """Feed one block. Returns a snap event dict, or None.
+
+        Runs on the PortAudio callback thread, which is why the one structure
+        the main loop also reads is appended to under a lock. See speech_lock.
+        """
         self._remember(block)
-        """Feed one block. Returns a snap event dict, or None."""
         self.block_index += 1
         hf, hf_ratio = self.features(block)
-        self.speech_hist.append((self.block_index, self.last_speech))
+        with self.speech_lock:
+            self.speech_hist.append((self.block_index, self.last_speech))
         self._track_speech_floor()
 
         if self.noise_hf is None:
@@ -1994,6 +2022,8 @@ def cmd_whoami(cfg, seconds=4):
         print("  a snap here sends: %s" % prof["activate"])
         if prof.get("mode") == "dictation" and prof.get("send"):
             print("  a confirming snap sends: %s" % prof["send"])
+        if prof.get("mode") == "converse":
+            print("  to end it, snap twice: %s again" % prof["activate"])
     else:
         why = ("no activate key set yet" if not prof.get("activate")
                else "profile is disabled")
@@ -2005,6 +2035,13 @@ def cmd_whoami(cfg, seconds=4):
 
 STOP, GONE = "stop", "gone"
 IDLE, RECORDING, SETTLING = "idle", "recording", "settling"
+# The converse half of the machine. TALKING is the app's voice mode running;
+# ARMED is the first snap of a stop pair having landed, with nothing pressed
+# yet. Separate names rather than reuse of RECORDING and SETTLING because the
+# keystrokes differ: leaving RECORDING presses the stop key and leaving
+# SETTLING presses the send key, while here both ends press the same toggle
+# and the middle step presses nothing at all.
+TALKING, ARMED = "talking", "armed"
 
 
 def strict_profile(cfg):
@@ -2016,7 +2053,12 @@ def strict_profile(cfg):
 
 
 def send_window_for(prof, cfg):
-    """How long after a stop a second snap still means "send", for this app.
+    """How long the second snap of a pair still counts, for this app.
+
+    In dictation that pair is a stop followed by a send. In converse it is the
+    two snaps that end a conversation. Same question either way - how long a
+    gesture stays open - so the same number and the same per-profile override
+    answer both.
 
     One global number cannot fit both cases, and measurement says so.
 
@@ -2082,6 +2124,52 @@ def classify(state, ev, held_ms, cfg, strict, start_gate, prof=None):
         return None, "too dull to confirm a send (tail %.2f < %.2f); ignored" % (
             ev["tail_hf"], cfg["strict_tail_hf_ratio_min"])
     return "send", ""
+
+
+def classify_converse(state, ev, held_ms, cfg, strict, start_gate, prof=None):
+    """Decide what a confirmed snap means for a converse-mode app.
+
+    Returns (action, note) like classify does: "start", "arm", "stop" or None.
+
+    The shape is deliberately the same as classify's - one gesture out of every
+    state, so a snap is never ambiguous - but the middle step does the opposite
+    thing. In dictation the middle snap presses the stop key and the pair that
+    follows is about sending. Here the middle snap presses nothing; it only
+    arms, and the pair is the stop itself.
+
+    That inversion is the whole point of the mode. These apps toggle their
+    voice mode on one key, so under oneshot every false positive after the
+    first snap ended a conversation the user was in the middle of. A stop that
+    needs two snaps inside one window is roughly as unlikely to happen by
+    accident as the send pair is, which is to say it has not been observed.
+
+    The strict gate applies to the confirming snap for the same reason it
+    applies to a send: the action cannot be taken back by another snap, so the
+    evidence for it should be better than the evidence for starting something.
+    """
+    if state == IDLE:
+        if start_gate.offer(ev):
+            return "start", ""
+        return None, "still in trigger cooldown"
+
+    if state == TALKING:
+        # Same guard as RECORDING, and for the same reason: the app needs a
+        # moment to actually open its microphone, and the tail of the starting
+        # snap must not read as the first half of a stop.
+        if held_ms < cfg["min_recording_ms"]:
+            return None, "only %.0f ms into the conversation; need %.0f to arm" % (
+                held_ms, cfg["min_recording_ms"])
+        return "arm", ""
+
+    # ARMED: one snap of the stop pair has landed and nothing has been pressed.
+    window = send_window_for(prof, cfg)
+    if held_ms > window:
+        return None, "%.0f ms after the first snap; pair window is %.0f" % (
+            held_ms, window)
+    if not strict.accepts(ev["peak_db"], ev["tail_hf"], ev["decay_ms"]):
+        return None, "too dull to confirm a stop (tail %.2f < %.2f); ignored" % (
+            ev["tail_hf"], cfg["strict_tail_hf_ratio_min"])
+    return "stop", ""
 
 
 def drain(q):
@@ -2325,6 +2413,9 @@ def listen(cfg, dry_run, instance, watch, record=None):
         elif prof["mode"] == "dictation":
             print("    %-34s %-11s snap %s on/off, snap twice -> %s"
                   % (where, prof["mode"], prof["activate"], prof["send"]))
+        elif prof["mode"] == "converse":
+            print("    %-34s %-11s snap %s on, snap TWICE %s off"
+                  % (where, prof["mode"], prof["activate"], prof["activate"]))
         else:
             print("    %-34s %-11s snap -> %s"
                   % (where, prof["mode"], prof["activate"]))
@@ -2374,6 +2465,17 @@ def listen(cfg, dry_run, instance, watch, record=None):
             if state == SETTLING and held_ms > send_window_for(active, cfg):
                 state, since = IDLE, now
                 held_ms = 0.0
+            # An armed stop that never got its second snap lapses back to
+            # TALKING rather than to IDLE, because nothing was pressed and the
+            # conversation is still running. The clock is wound back past
+            # min_recording_ms on the way: that guard exists to stop a snap
+            # landing on the heels of the start, and by now the conversation
+            # has been going for at least a second. Making the user wait it out
+            # again would swallow their next honest attempt to stop.
+            elif state == ARMED and held_ms > send_window_for(active, cfg):
+                state = TALKING
+                since = now - cfg["min_recording_ms"] / 1000.0
+                held_ms = cfg["min_recording_ms"]
             # Nothing tells us when the app stops recording on its own, so a
             # dictation that self-terminated on silence would otherwise leave
             # this stuck in RECORDING, one full cycle out of step.
@@ -2462,6 +2564,43 @@ def listen(cfg, dry_run, instance, watch, record=None):
                     print("[%s] TRIGGER %s  -> %s  %s activated"
                           % (stamp, detail, prof["activate"], prof["name"]))
                 state, since, active = IDLE, time.monotonic(), None
+                start_gate.reset()
+                continue
+
+            # A voice mode that lives on one toggle key. One snap opens it, a
+            # pair closes it, and the first snap of that pair presses nothing -
+            # so a false positive mid-conversation costs nothing at all, which
+            # is the entire reason this mode exists next to oneshot.
+            if prof.get("mode") == "converse":
+                action, note = classify_converse(state, ev, held_ms, cfg,
+                                                 strict, start_gate, prof)
+                if action is None:
+                    print("[%s] snap    %s  %s" % (stamp, detail, note))
+                    continue
+                if dry_run:
+                    print("[%s] TRIGGER %s  focus=%s  would %s in %s (dry run)"
+                          % (stamp, detail, where, action, prof["name"]))
+                elif action == "arm":
+                    # Nothing is pressed here on purpose. Until the pair
+                    # completes, the app has not been touched.
+                    print("[%s] armed   %s  snap again within %.0f ms to end "
+                          "%s" % (stamp, detail, send_window_for(prof, cfg),
+                                  prof["name"]))
+                    det.expect_pair()
+                else:
+                    # start and stop press the same key, because the app treats
+                    # it as a toggle. A refusal leaves the state alone for the
+                    # same reason it does in dictation: nothing happened over
+                    # there, so nothing here should move.
+                    if not send_key_guarded(mod_vks, key_vk, prof,
+                                            prof["activate"]):
+                        continue
+                    print("[%s] TRIGGER %s  -> %s  %s voice %s"
+                          % (stamp, detail, prof["activate"], prof["name"],
+                             "ON" if action == "start" else "OFF"))
+                state = {"start": TALKING, "arm": ARMED, "stop": IDLE}[action]
+                active = prof if state != IDLE else None
+                since = time.monotonic()
                 start_gate.reset()
                 continue
 

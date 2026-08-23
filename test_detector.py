@@ -17,6 +17,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from snap_to_dictate import (CONFIG_PATH, DEFAULTS, IDLE, RECORDING, SETTLING,
+                             TALKING, ARMED, classify_converse,
                              SnapDetector, TriggerGate, claim_instance,
                              classify, cmd_run, cmd_stop, db, legacy_profile,
                              load_config, parse_key, profile_ready,
@@ -298,6 +299,83 @@ check("every state has an exit",
                  for i, st in enumerate((IDLE, RECORDING)))),
       ["start", "stop"])
 start_gate.reset()
+
+# converse: one snap in, a pair out. Written because oneshot pressed the same
+# toggle key on every snap, so a false positive mid-conversation ended a
+# conversation the user was in the middle of.
+# push() runs on the audio callback thread and speech_db() reads from the main
+# loop. Without a lock the deque raises "deque mutated during iteration" and the
+# listener dies, which it did at 15:09:19 on 2026-08-23. Concurrency, so this
+# proves the fix rather than asserting a lock is present: it fails without one.
+print(NL_ + "detector thread safety")
+import threading as _th
+import time as _time
+_det = SnapDetector(live)
+_det.speech_hist.extend((i, 1e-4) for i in range(300))
+_det.speech_floor, _det.block_index = 1e-5, 300
+_errs, _stop = [], []
+def _writer():
+    while not _stop:
+        with _det.speech_lock:
+            _det.block_index += 1
+            _det.speech_hist.append((_det.block_index, 1e-4))
+def _reader():
+    while not _stop:
+        try:
+            _det.speech_db(_det.block_index - 100, 150, 300)
+        except Exception as exc:
+            _errs.append(repr(exc))
+_ts = [_th.Thread(target=_writer)] + [_th.Thread(target=_reader) for _ in range(3)]
+for _t in _ts: _t.start()
+_time.sleep(1.0)
+_stop.append(True)
+for _t in _ts: _t.join()
+check("speech_hist survives being read while the audio thread appends",
+      _errs[:1], [])
+
+print(NL_ + "converse cycle")
+_CONV_SRC = (Path(__file__).resolve().parent
+             / "snap_to_dictate.py").read_text(encoding="utf-8")
+CONV = dict(live, profiles=DEFAULTS["profiles"])
+cg = TriggerGate(CONV, bm)
+check("idle + one snap opens the voice mode",
+      classify_converse(IDLE, event(GOOD, 100), 0.0, CONV, strict, cg)[0],
+      "start")
+cg.reset()
+check("a snap too soon after opening is ignored",
+      classify_converse(TALKING, event(GOOD, 120), 200.0, CONV, strict, cg)[0],
+      None)
+check("talking + one snap only ARMS, it does not press anything",
+      classify_converse(TALKING, event(GOOD, 300), 5000.0, CONV, strict, cg)[0],
+      "arm")
+check("armed + a second snap ends the conversation",
+      classify_converse(ARMED, event(GOOD, 340), 232.0, CONV, strict, cg)[0],
+      "stop")
+check("armed + a dull transient does not end it",
+      classify_converse(ARMED, event(DULL, 340), 232.0, CONV, strict, cg)[0],
+      None)
+check("armed + a late second snap does not end it",
+      classify_converse(ARMED, event(GOOD, 500), 9000.0, CONV, strict, cg)[0],
+      None)
+# The bug this mode exists to kill: under oneshot every one of these pressed
+# ctrl+b, and ctrl+b is a toggle. Now a lone snap mid-conversation reaches at
+# most ARMED, and ARMED presses nothing.
+check("no single snap can ever end a conversation on its own",
+      [classify_converse(TALKING, event(GOOD, 300 + 40 * i), 5000.0,
+                         CONV, strict, TriggerGate(CONV, bm))[0]
+       for i in range(6)],
+      ["arm"] * 6)
+check("...and an armed pair that lapses presses nothing either",
+      classify_converse(ARMED, event(GOOD, 900), 99000.0, CONV, strict, cg)[0],
+      None)
+# ARMED must fall back to TALKING, never to IDLE: nothing was pressed, so the
+# app is still in voice mode, and dropping to IDLE would make the next single
+# snap press the toggle and end it - exactly the bug this mode removes.
+check("an armed stop that lapses returns to TALKING, not IDLE",
+      "state = TALKING" in _CONV_SRC and "elif state == ARMED" in _CONV_SRC,
+      True)
+check("...and the first snap of the pair presses no key",
+      _CONV_SRC.count("elif action == \"arm\":"), 1)
 check("reset forgets a half-finished double", start_gate.pending_block, None)
 
 print(NL_ + "timing arithmetic")

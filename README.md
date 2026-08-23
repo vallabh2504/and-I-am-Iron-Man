@@ -178,13 +178,13 @@ What is wired out of the box:
 | Window | Matched by | Gesture | Sends |
 |---|---|---|---|
 | Claude desktop | `claude.exe` | snap on, snap off, snap twice submits | `ctrl+d`, then `enter` |
-| Codex | `chatgpt.exe` plus `^Codex$` | one snap | `ctrl+b` |
-| ChatGPT | `chatgpt.exe` plus `^ChatGPT$` | one snap | `ctrl+b` |
+| Codex | `chatgpt.exe` plus `^Codex$` | snap on, **snap twice** off | `ctrl+b`, then `ctrl+b` |
+| ChatGPT | `chatgpt.exe` plus `^ChatGPT$` | snap on, **snap twice** off | `ctrl+b`, then `ctrl+b` |
 | Antigravity | `antigravity.exe` | snap on, snap off, snap twice submits | `ctrl+m`, then `enter` |
 | Antigravity IDE | `antigravity ide.exe` | snap on, snap off, snap twice submits | `ctrl+space` through Windows, then `enter` |
 | VS Code | `code.exe` | snap on, snap off, snap twice submits | `ctrl+space` through Windows, then `enter` |
 | Anything else | nothing claims it, so the catch-all does | snap on, snap off, snap twice submits | `ctrl+space` through Windows, then `enter` |
-| 17 named processes | terminals, the desktop shell, UAC and password prompts | none | nothing, ever |
+| 21 named processes | terminals, the Start menu, search, UAC and password prompts | none | nothing, ever |
 
 **Treat *Matched by* and *Sends* as this machine's answers, not yours.** The keys
 were the right ones for the app versions installed here on the day they were
@@ -409,15 +409,52 @@ accessibility focus rather than anything to do with voice, so letting it inherit
 the desktop app's key would fire a real but unrelated command. Matching is on
 the whole image name and never a prefix, so it cannot happen by accident.
 
-### Two gesture modes
+### Three gesture modes
 
 | Mode | Gesture | For |
 |---|---|---|
 | `dictation` | snap starts, snap stops, second snap submits | anything that transcribes into a composer |
-| `oneshot` | one snap presses `activate`, nothing else | a voice agent that listens and replies on its own |
+| `converse` | one snap starts, a **double** snap ends | a voice mode that lives on one toggle key |
+| `oneshot` | one snap presses `activate`, nothing else | a key that does something once and has no state |
 
 Only `dictation` runs the stop-side silence check, because only `dictation` has
 a stop to protect.
+
+**Why `converse` exists.** ChatGPT and Codex both open and close voice mode with
+the same key, and both ran as `oneshot`, which pressed that key on every snap.
+That is fine for starting and wrong for everything after: any false positive
+during a conversation pressed `ctrl+b` a second time and ended a conversation
+the user was in the middle of. Snaps are not rare enough for that to be
+acceptable. A knuckle on a desk, a stapler, a keyboard hit at the wrong angle.
+
+So the stop needs two snaps inside `send_window_ms`, and the important half is
+what the **first** snap of that pair does, which is nothing. It arms and it
+presses no key at all, so a lone false positive cannot reach the app. If no
+second snap follows, the arm lapses back to talking and the conversation
+carries on undisturbed. The double snap was already measured on this machine as
+a deliberate gesture that has never once been produced by accident, which is
+why `dictation` trusts it to submit; the same evidence is what makes it safe to
+trust with a stop.
+
+The full cycle, with three false positives in the middle of it:
+
+```
+snap                                          -> ctrl+b   voice ON
+  false positive  4 s in                      -> armed, nothing pressed
+  ...750 ms later the arm lapses, still talking
+  false positive 10 s in                      -> armed, nothing pressed
+  false positive 13 s in                      -> armed, nothing pressed
+snap, then snap again 350 ms later            -> ctrl+b   voice OFF
+```
+
+**What it cannot know.** Nothing tells this tool that a conversation ended
+inside the app, so if you end one by clicking rather than by snapping, it still
+believes voice is on and your next single snap will only arm. Snap twice and it
+resyncs. The same goes for snapping in a different app while a conversation is
+running: that drops the held state, and the single snap after it will press
+`ctrl+b` and close the conversation rather than open one. Both are the price of
+never reading the app's state, which is the same reason `dictation` cannot tell
+when an app stopped listening on its own.
 
 ### Adding your own app
 
@@ -495,11 +532,29 @@ root, but an unplugged microphone, a device claimed in exclusive mode, or a
 driver reset on resume can still end the listener, and none of those announce
 themselves.
 
-So the second trigger runs the launcher every five minutes, forever. Almost
+So the second trigger runs the launcher every two minutes, forever. Almost
 every run does nothing, because the listener holds a named event as a singleton
-and the second copy exits before it opens the microphone. The cost is one
-Python startup. The run that matters is the one after a crash, which brings the
-listener back within five minutes instead of at the next logon.
+and the second copy exits before it opens the microphone. The run that matters
+is the one after a crash, which brings the listener back within two minutes
+instead of at the next logon.
+
+The interval is a measured trade, not a guess. A losing run costs 1.4 to 1.6
+seconds of one core, almost all of it importing numpy and sounddevice before
+the singleton check can turn it away. At two minutes that is a bit over one
+percent of one core, against a worst case of two minutes deaf. Five minutes
+costs half a percent and leaves you deaf for five, and one minute costs about
+two and a half. Change it with `Repetition.Interval` on the second trigger:
+
+```powershell
+$t = Get-ScheduledTask -TaskName SnapToDictate
+$t.Triggers[1].Repetition.Interval = 'PT2M'
+Set-ScheduledTask -TaskName SnapToDictate -Trigger $t.Triggers
+```
+
+The gap is real and it has been felt. The listener died at 15:09:19 on
+23 August 2026 and the watchdog restarted it at 15:14:06, four minutes and
+forty-seven seconds later, which read from the outside exactly like a watchdog
+that was not working at all.
 
 It has to be a separate trigger rather than a repetition added to the logon
 one. A trigger's repetition only starts counting when that trigger fires, so a
