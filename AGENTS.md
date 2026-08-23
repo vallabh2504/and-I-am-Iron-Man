@@ -400,6 +400,18 @@ there is nothing left to wait for. A snap inside the hold becomes
 `pending["follow"]` and the send is certain. The cost is about 600 ms of extra
 recording.
 
+Capturing the confirming snap was only half of it. The silence guard runs in the
+same function and its refusal returns `None`, dropping the pending and the
+follow together, and the confirming snap lands *inside* `speech_window_ms`, so
+it raises the level the guard measures. `snap.log` at 18:58:29 on the same day:
+"holding as a send confirmation" and then "still talking 14 dB over the floor
+150-300 ms later; not a stop  `[before 4 dB]`". Quiet before the transient, loud
+after it, and the loud part was the confirmation itself. Neither the stop nor the
+send happened. The guard now applies only when `pending["follow"] is None`: a
+pair states the intent the guard exists to infer, so it outranks the guess. What
+that costs is two false positives inside one hold stopping and sending, which
+has to clear `expect_pair` first.
+
 `classify`'s `SETTLING` refusal branch is unreachable from `listen()`: the
 expiry in the main loop always fires first, which is why 2701 lines of log
 contain its message zero times. The expiry prints its own line now. Keep the

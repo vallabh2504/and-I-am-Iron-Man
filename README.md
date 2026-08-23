@@ -401,6 +401,16 @@ snap inside it is the send, deterministically, with the pair itself as the
 evidence rather than a clock. It costs about 600 ms of extra recording, which is
 the cheapest thing in this document.
 
+One more thing had to go with it. The held stop also runs a silence check, which
+asks whether the room went quiet just after the snap and drops the stop if it
+did not. The confirming snap arrives inside the exact stretch that check
+measures, so a deliberate double snap was making the room loud and then being
+refused for it, and the refusal threw away both snaps at once. The log caught it
+in the act: *holding as a send confirmation*, then *still talking 14 dB over the
+floor, not a stop*, with the level before the snap at 4 dB. The room was quiet.
+The noise was the confirmation. A confirmed pair now outranks the silence check,
+because the check is guessing at something the pair says outright.
+
 `send_window_ms` still exists and still closes `SETTLING` afterwards, so a snap
 much later reads as a fresh start. It is one number for every app now. The
 per-profile override is still there for when a measurement asks for it; nothing

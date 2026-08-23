@@ -2220,11 +2220,13 @@ def resolve_pending(pending, det, cfg, dry_run, events, state, since,
     not from whatever is in front now - the stop belongs to the window that
     started recording, even if focus has since moved.
 
-    Two ways out. If the speech band is still loud a beat after the transient,
-    the speaker never stopped talking, so the transient was part of the speech
-    and the stop is dropped. Otherwise the stop goes through, and a snap that
-    arrived while we were waiting is honoured as the send confirmation it was
-    meant to be.
+    Two ways out. If the speech band is still loud a beat after the transient
+    and no second snap arrived, the speaker never stopped talking, so the
+    transient was part of the speech and the stop is dropped. Otherwise the
+    stop goes through, and a snap that arrived while we were waiting is
+    honoured as the send confirmation it was meant to be. A confirmed pair
+    outranks the silence guess: the guess is about intent, and the pair states
+    it outright.
     """
     mod_vks, key_vk, mod_send, vk_send = pending["keys"]
     prof = pending["prof"]
@@ -2278,11 +2280,35 @@ def resolve_pending(pending, det, cfg, dry_run, events, state, since,
         return state, since, pending
 
     stamp = time.strftime("%H:%M:%S")
-    if level is not None and level >= cfg["speech_over_floor_db"]:
+    # The silence question is a guess about intent, and a confirming snap has
+    # already answered it. Asking it anyway is worse than redundant, because
+    # the second snap of a pair lands inside speech_window_ms - 150 to 300 ms
+    # after the onset, against measured pair gaps of 76 to 989 ms - and raises
+    # the very level being measured. snap.log, 2026-08-23:
+    #
+    #   [18:58:29] held  ...  holding as a send confirmation
+    #   [18:58:29] snap  ...  still talking 14 dB over the floor
+    #                         150-300 ms later; not a stop  [before 4 dB]
+    #
+    # Quiet before the transient, loud after it, and the loud part was the
+    # confirmation itself. Both snaps were discarded, so the user got neither
+    # the stop nor the send: a double snap failed for being deliberate.
+    #
+    # The veto therefore applies only to a lone stop, where there is genuinely
+    # something left to infer. What that costs is two false positives inside
+    # one hold now stopping and sending instead of being caught here. That
+    # pair has to clear expect_pair's gates first, and a person who snapped
+    # twice on purpose is the case this program exists for.
+    if (pending["follow"] is None
+            and level is not None and level >= cfg["speech_over_floor_db"]):
         print("[%s] snap    %s  still talking %.0f dB over the floor "
               "%.0f-%.0f ms later; not a stop%s"
               % (stamp, pending["detail"], level, lo_ms, hi_ms, was))
         return state, since, None
+    if (level is not None and level >= cfg["speech_over_floor_db"]):
+        print("[%s] held    %s  %.0f dB over the floor after, but the pair "
+              "confirmed it; stopping anyway%s"
+              % (stamp, pending["detail"], level, was))
 
     heard = "quiet" if level is None else "%.0f dB over the floor" % level
     heard += was

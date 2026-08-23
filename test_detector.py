@@ -1125,6 +1125,39 @@ check("the hold can never outlast the pending timeout",
 check("the pair window is what the hold waits for, not a number of its own",
       'min(cfg["double_max_ms"], PENDING_TIMEOUT_MS)' in _src, True)
 
+
+# Capturing the confirming snap was only half of it. The silence guard ran
+# first and its refusal threw the pending away, follow and all - and the
+# confirming snap lands inside speech_window_ms, so it raises the level the
+# guard measures. snap.log 2026-08-23 18:58:29: held as a send confirmation,
+# then "still talking 14 dB over the floor ... not a stop  [before 4 dB]".
+# Quiet before, loud after, and the loud part was the confirmation. The user
+# got neither the stop nor the send. A pair states the intent the guard is
+# trying to infer, so a confirmed pair outranks it.
+class _LoudRoom:
+    """A detector stub for which the speech band never goes quiet."""
+
+    def speech_db(self, onset_block, lo_ms, hi_ms):
+        return live["speech_over_floor_db"] + 6.0
+
+
+def _resolve_in(room, pending):
+    return _s.resolve_pending(pending, room, live, True, _q.Queue(),
+                              RECORDING, _tm.monotonic(), start_gate)
+
+
+_state, _, _rest = _resolve_in(_LoudRoom(),
+                               _held(live["double_max_ms"] + 50.0))
+check("a lone stop into a loud room is still refused",
+      (_state, _rest), (RECORDING, None))
+_state, _, _rest = _resolve_in(_LoudRoom(), _held(0.0, follow=event(GOOD, 20)))
+check("...but a confirmed pair stops and sends however loud the room is",
+      (_state, _rest), (IDLE, None))
+check("the refusal asks whether a pair confirmed it",
+      'if (pending["follow"] is None' in _src, True)
+check("...and the override says so in the log rather than passing silently",
+      "but the pair " in _src, True)
+
 # classify still refuses a late send, and that branch is now unreachable from
 # listen(): the expiry above always fires first. 2701 lines of snap.log contain
 # its message exactly zero times, which is why the expiry prints one of its
